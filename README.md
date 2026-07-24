@@ -119,6 +119,10 @@ one-offs.
 | Gamma API URL | `gamma_url` | `DETECTOR_GAMMA_URL` | gamma-api.polymarket.com |
 | Watchlist file | `watch_file` | `DETECTOR_WATCH_FILE` | `watchlist.json` |
 | Search result limit | `search_limit` | `DETECTOR_SEARCH_LIMIT` | `8` |
+| Category auto-discovery | `auto_discover` | `DETECTOR_AUTO_DISCOVER` | `true` |
+| Discovery interval (s) | `discover_interval_secs` | `DETECTOR_DISCOVER_INTERVAL_SECS` | `300` |
+| Discovery min volume | `discover_min_volume` | `DETECTOR_DISCOVER_MIN_VOLUME` | `0` |
+| Discovery max markets | `discover_max_markets` | `DETECTOR_DISCOVER_MAX_MARKETS` | `100000` |
 | HTTP timeout (s) | `http_timeout_secs` | `DETECTOR_HTTP_TIMEOUT_SECS` | `15` |
 | Log level | `log_level` | `DETECTOR_LOG_LEVEL` | `info` |
 | Fee (bps/side) | `fee_bps` | `DETECTOR_FEE_BPS` | `0` |
@@ -141,7 +145,12 @@ one-offs.
 | Alert min profit | `alert_min_profit` | `TELEGRAM_ALERT_MIN_PROFIT` | `1.0` |
 | Only profitable | `only_profitable` | `TELEGRAM_ONLY_PROFITABLE` | `true` |
 | Re-alert improvement | `realert_improvement` | `TELEGRAM_REALERT_IMPROVEMENT` | `0.01` |
+| Settings file | `settings_file` | `TELEGRAM_SETTINGS_FILE` | `bot-settings.json` |
 | Log level | `log_level` | `TELEGRAM_LOG_LEVEL` | `info` |
+
+The `alert_*` / `only_profitable` values are just the **initial** notification filters;
+once running they are changed live from chat (`/set`, `/mute`) and persisted to
+`settings_file`.
 
 ## Run
 
@@ -161,17 +170,26 @@ the websocket immediately.
 
 | Command | Effect |
 |---|---|
-| *(paste a Polymarket link)* | Watch that market |
-| `/add <link \| slug>` | Watch a market |
-| `/remove <slug \| condition_id>` | Stop watching |
+| `/add_category <link \| slug>` | Track a whole category (e.g. `polymarket.com/iran`) — every market in it is pulled in and kept in sync |
+| `/remove_category <slug>` | Stop tracking a category |
+| `/categories` | List tracked categories |
+| *(paste a Polymarket link)* | Watch a single market |
+| `/add <link \| slug>` | Watch a single market |
+| `/remove <slug \| condition_id>` | Unpin a single market |
 | `/list` | Watched markets |
-| `/search <query>` | Find markets, returns tap-to-copy slugs to `/add` |
+| `/search <query>` | Find markets, returns tap-to-copy slugs |
+| `/settings` | Show alert filters |
+| `/set <key> <value>` | Tune alerts — keys: `enabled`, `only_profitable`, `min_edge`, `min_profit` |
+| `/mute`, `/unmute` | Pause / resume alerts |
 | `/top` | Current best opportunities |
-| `/status` | Backend health (ws connected, watched count) |
+| `/status` | Backend health (ws connected, watched/category counts) |
 | `/help`, `/start` | Usage |
 
-Alerts de-duplicate per market: the same market re-alerts only when its edge improves by
-at least `realert_improvement`.
+**Categories** are the main workflow: add one and the detector auto-pulls all its markets
+from Polymarket, re-checking every `discover_interval_secs` (default 5 min) to add new
+markets and drop resolved ones. **Notification filters** (`/set`, `/mute`) are held per-bot,
+persisted to `settings_file`, and applied to every alert. Alerts de-duplicate per market:
+a market re-alerts only when its edge improves by at least `realert_improvement`.
 
 ## REST API
 
@@ -180,10 +198,13 @@ at least `realert_improvement`.
 | `GET /health` | ws connection, watched count, last-update age |
 | `GET /config` | Effective arbitrage parameters |
 | `GET /opportunities` | Current opportunities (sorted by net profit) |
+| `GET /categories` | List tracked categories |
+| `POST /category` | Track a category — body `{"input":"<link\|slug\|condition_id>"}` |
+| `DELETE /category/:slug` | Stop tracking a category |
 | `GET /watch` | List watched markets |
-| `POST /watch` | Add a market — body `{"input":"<link\|slug\|condition_id>"}` |
-| `DELETE /watch/:key` | Remove a market by slug or condition id |
-| `GET /search?q=&limit=` | Search markets to add |
+| `POST /watch` | Pin a single market — body `{"input":"<link\|slug\|condition_id>"}` |
+| `DELETE /watch/:key` | Unpin a market by slug or condition id |
+| `GET /search?q=&limit=` | Search markets |
 
 `GET /opportunities` filters: `profitable=true|false`, `min_edge=<f>`, `min_profit=<f>`,
 `limit=<n>`. Each opportunity carries market metadata plus an `arb` object

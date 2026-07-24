@@ -25,6 +25,10 @@ pub struct Config {
     pub search_limit: usize,
     pub http_timeout_secs: u64,
     pub log_level: String,
+    pub auto_discover: bool,
+    pub discover_interval_secs: u64,
+    pub discover_min_volume: f64,
+    pub discover_max_markets: usize,
     pub arb: ArbParams,
 }
 
@@ -38,6 +42,10 @@ impl Default for Config {
             search_limit: 8,
             http_timeout_secs: 15,
             log_level: "info".into(),
+            auto_discover: true,
+            discover_interval_secs: 300,
+            discover_min_volume: 0.0,
+            discover_max_markets: 100_000,
             arb: ArbParams::default(),
         }
     }
@@ -55,6 +63,10 @@ pub struct PartialConfig {
     pub search_limit: Option<usize>,
     pub http_timeout_secs: Option<u64>,
     pub log_level: Option<String>,
+    pub auto_discover: Option<bool>,
+    pub discover_interval_secs: Option<u64>,
+    pub discover_min_volume: Option<f64>,
+    pub discover_max_markets: Option<usize>,
 
     pub fee_bps: Option<f64>,
     pub slippage_bps: Option<f64>,
@@ -79,6 +91,10 @@ impl PartialConfig {
             search_limit,
             http_timeout_secs,
             log_level,
+            auto_discover,
+            discover_interval_secs,
+            discover_min_volume,
+            discover_max_markets,
             fee_bps,
             slippage_bps,
             gas_cost,
@@ -98,6 +114,10 @@ impl PartialConfig {
             search_limit: env_parse("DETECTOR_SEARCH_LIMIT"),
             http_timeout_secs: env_parse("DETECTOR_HTTP_TIMEOUT_SECS"),
             log_level: env_str("DETECTOR_LOG_LEVEL"),
+            auto_discover: env_parse("DETECTOR_AUTO_DISCOVER"),
+            discover_interval_secs: env_parse("DETECTOR_DISCOVER_INTERVAL_SECS"),
+            discover_min_volume: env_parse("DETECTOR_DISCOVER_MIN_VOLUME"),
+            discover_max_markets: env_parse("DETECTOR_DISCOVER_MAX_MARKETS"),
             fee_bps: env_parse("DETECTOR_FEE_BPS"),
             slippage_bps: env_parse("DETECTOR_SLIPPAGE_BPS"),
             gas_cost: env_parse("DETECTOR_GAS_COST"),
@@ -117,6 +137,12 @@ impl PartialConfig {
             search_limit: self.search_limit.unwrap_or(d.search_limit),
             http_timeout_secs: self.http_timeout_secs.unwrap_or(d.http_timeout_secs),
             log_level: self.log_level.unwrap_or(d.log_level),
+            auto_discover: self.auto_discover.unwrap_or(d.auto_discover),
+            discover_interval_secs: self
+                .discover_interval_secs
+                .unwrap_or(d.discover_interval_secs),
+            discover_min_volume: self.discover_min_volume.unwrap_or(d.discover_min_volume),
+            discover_max_markets: self.discover_max_markets.unwrap_or(d.discover_max_markets),
             arb: ArbParams {
                 fee_bps: self.fee_bps.unwrap_or(d.arb.fee_bps),
                 slippage_bps: self.slippage_bps.unwrap_or(d.arb.slippage_bps),
@@ -160,6 +186,14 @@ pub struct Cli {
     #[arg(long)]
     pub log_level: Option<String>,
     #[arg(long)]
+    pub auto_discover: Option<bool>,
+    #[arg(long)]
+    pub discover_interval_secs: Option<u64>,
+    #[arg(long)]
+    pub discover_min_volume: Option<f64>,
+    #[arg(long)]
+    pub discover_max_markets: Option<usize>,
+    #[arg(long)]
     pub fee_bps: Option<f64>,
     #[arg(long)]
     pub slippage_bps: Option<f64>,
@@ -183,6 +217,10 @@ impl Cli {
             search_limit: self.search_limit,
             http_timeout_secs: self.http_timeout_secs,
             log_level: self.log_level,
+            auto_discover: self.auto_discover,
+            discover_interval_secs: self.discover_interval_secs,
+            discover_min_volume: self.discover_min_volume,
+            discover_max_markets: self.discover_max_markets,
             fee_bps: self.fee_bps,
             slippage_bps: self.slippage_bps,
             gas_cost: self.gas_cost,

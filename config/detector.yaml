@@ -8,7 +8,7 @@ bind_addr: "0.0.0.0:8080"
 ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 gamma_url: "https://gamma-api.polymarket.com"
 
-# Watched markets are persisted here and restored on restart.
+# Watched categories and pinned markets are persisted here and restored on restart.
 watch_file: "watchlist.json"
 
 # Max results returned by /search.
@@ -16,6 +16,14 @@ search_limit: 8
 
 http_timeout_secs: 15
 log_level: "info"
+
+# Category auto-discovery: every `discover_interval_secs` the markets of every
+# watched category (added via the bot) are pulled from Gamma and the watchlist is
+# synced (new markets added, closed ones removed).
+auto_discover: true
+discover_interval_secs: 300
+discover_min_volume: 0      # raise to skip tiny/illiquid markets in a category
+discover_max_markets: 100000
 
 # Arbitrage economics.
 fee_bps: 0          # Polymarket CLOB fee per side, currently 0

@@ -7,7 +7,17 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::state::Market;
+use crate::state::{Category, Market};
+
+#[derive(Debug, Deserialize)]
+struct Tag {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    slug: String,
+}
 
 pub struct Gamma {
     http: reqwest::Client,
@@ -67,6 +77,61 @@ impl Gamma {
             }
         }
         out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Resolve a category link/slug (e.g. `polymarket.com/iran` or `iran`) into
+    /// its Polymarket tag. Returns `None` if no candidate slug maps to a tag.
+    pub async fn resolve_category(&self, input: &str) -> Result<Option<Category>> {
+        for slug in slug_candidates(input) {
+            let url = format!("{}/tags/slug/{}", self.base, urlencode(&slug));
+            if let Ok(tag) = self.get_json::<Tag>(&url).await {
+                if !tag.id.is_empty() {
+                    return Ok(Some(Category {
+                        slug: tag.slug,
+                        label: tag.label,
+                        tag_id: tag.id,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every active, order-book-enabled market carrying `tag_id`, above
+    /// `min_volume`, up to `cap`. Paginates by rows returned, so it is robust to
+    /// the server's max page size.
+    pub async fn markets_by_tag(
+        &self,
+        tag_id: &str,
+        min_volume: f64,
+        cap: usize,
+    ) -> Result<Vec<Market>> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        let page = 500usize;
+        loop {
+            let url = format!(
+                "{}/markets?tag_id={}&active=true&closed=false&limit={}&offset={}&order=volumeNum&ascending=false",
+                self.base, urlencode(tag_id), page, offset
+            );
+            let raw: Vec<GammaMarket> = self.get_json(&url).await?;
+            if raw.is_empty() {
+                break;
+            }
+            offset += raw.len();
+            for m in raw {
+                if let Some(mk) = m.into_market() {
+                    if mk.volume >= min_volume {
+                        out.push(mk);
+                    }
+                }
+            }
+            if out.len() >= cap || offset >= 20_000 {
+                break;
+            }
+        }
+        out.truncate(cap);
         Ok(out)
     }
 

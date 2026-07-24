@@ -24,6 +24,7 @@ pub struct Config {
     pub alert_min_profit: f64,
     pub only_profitable: bool,
     pub realert_improvement: f64,
+    pub settings_file: PathBuf,
     pub log_level: String,
 }
 
@@ -39,6 +40,7 @@ impl Default for Config {
             alert_min_profit: 1.0,
             only_profitable: true,
             realert_improvement: 0.01,
+            settings_file: "bot-settings.json".into(),
             log_level: "info".into(),
         }
     }
@@ -56,6 +58,7 @@ pub struct PartialConfig {
     pub alert_min_profit: Option<f64>,
     pub only_profitable: Option<bool>,
     pub realert_improvement: Option<f64>,
+    pub settings_file: Option<PathBuf>,
     pub log_level: Option<String>,
 }
 
@@ -76,6 +79,7 @@ impl PartialConfig {
             alert_min_profit,
             only_profitable,
             realert_improvement,
+            settings_file,
             log_level
         );
         self
@@ -92,6 +96,7 @@ impl PartialConfig {
             alert_min_profit: env_parse("TELEGRAM_ALERT_MIN_PROFIT"),
             only_profitable: env_parse("TELEGRAM_ONLY_PROFITABLE"),
             realert_improvement: env_parse("TELEGRAM_REALERT_IMPROVEMENT"),
+            settings_file: env_str("TELEGRAM_SETTINGS_FILE").map(PathBuf::from),
             log_level: env_str("TELEGRAM_LOG_LEVEL"),
         }
     }
@@ -108,6 +113,7 @@ impl PartialConfig {
             alert_min_profit: self.alert_min_profit.unwrap_or(d.alert_min_profit),
             only_profitable: self.only_profitable.unwrap_or(d.only_profitable),
             realert_improvement: self.realert_improvement.unwrap_or(d.realert_improvement),
+            settings_file: self.settings_file.unwrap_or(d.settings_file),
             log_level: self.log_level.unwrap_or(d.log_level),
         }
     }
@@ -143,6 +149,8 @@ pub struct Cli {
     #[arg(long)]
     pub realert_improvement: Option<f64>,
     #[arg(long)]
+    pub settings_file: Option<PathBuf>,
+    #[arg(long)]
     pub log_level: Option<String>,
 }
 
@@ -158,6 +166,7 @@ impl Cli {
             alert_min_profit: self.alert_min_profit,
             only_profitable: self.only_profitable,
             realert_improvement: self.realert_improvement,
+            settings_file: self.settings_file,
             log_level: self.log_level,
         };
         (self.config, p)
