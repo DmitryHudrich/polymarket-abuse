@@ -13,8 +13,7 @@ services:
         BIN: detector
     restart: unless-stopped
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
       DETECTOR_BIND_ADDR: 0.0.0.0:8080
       DETECTOR_WATCH_FILE: /app/data/watchlist.json
@@ -37,8 +36,7 @@ services:
         BIN: telegram-bot
     restart: unless-stopped
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
       TELEGRAM_BACKEND_URL: http://detector:8080
     depends_on:
