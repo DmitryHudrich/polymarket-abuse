@@ -1,0 +1,26 @@
+# Detector (backend) configuration.
+# Precedence: defaults < this file < DETECTOR_* env vars < CLI flags.
+
+bind_addr: "0.0.0.0:8080"
+
+# Polymarket CLOB market websocket (order book stream) and Gamma REST
+# (used only to resolve links/slugs and to search — never in the hot path).
+ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+gamma_url: "https://gamma-api.polymarket.com"
+
+# Watched markets are persisted here and restored on restart.
+watch_file: "watchlist.json"
+
+# Max results returned by /search.
+search_limit: 8
+
+http_timeout_secs: 15
+log_level: "info"
+
+# Arbitrage economics.
+fee_bps: 0          # Polymarket CLOB fee per side, currently 0
+slippage_bps: 0     # buffer added to each buy price
+gas_cost: 0.0       # fixed USDC cost to merge/redeem the set
+max_capital: 1000   # capital cap per trade, USDC
+min_profit: 0.0     # net USDC profit to flag as profitable
+min_edge: 0.0       # minimum (1 - sum) to report at all

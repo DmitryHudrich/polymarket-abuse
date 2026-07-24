@@ -1,0 +1,18 @@
+# Telegram bot configuration.
+# Precedence: defaults < this file < TELEGRAM_* env vars < CLI flags.
+# Keep secrets out of this file; prefer env vars for bot_token/chat_id.
+
+bot_token: ""        # set via TELEGRAM_BOT_TOKEN
+chat_id: ""          # target chat for alerts, set via TELEGRAM_CHAT_ID
+
+backend_url: "http://localhost:8080"
+poll_interval_secs: 10
+http_timeout_secs: 15
+
+# Alert gating.
+alert_min_edge: 0.01       # minimum (1 - sum) to alert
+alert_min_profit: 1.0      # minimum net USDC profit to alert
+only_profitable: true      # ignore opportunities that don't clear costs
+realert_improvement: 0.01  # re-alert same market only if edge improves by this
+
+log_level: "info"

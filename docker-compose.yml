@@ -1,0 +1,49 @@
+# Runs both services. Locally: `docker compose up -d --build`.
+# On the VPS the deploy workflow sets DETECTOR_IMAGE/BOT_IMAGE to pushed GHCR
+# tags and runs `docker compose pull && up -d` (no build on the box).
+# Secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, any DETECTOR_* tuning) live in
+# a `.env` file next to this compose file.
+
+services:
+  detector:
+    image: ${DETECTOR_IMAGE:-polymarket-arb-detector:local}
+    build:
+      context: .
+      args:
+        BIN: detector
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DETECTOR_BIND_ADDR: 0.0.0.0:8080
+      DETECTOR_WATCH_FILE: /app/data/watchlist.json
+    volumes:
+      - arb-data:/app/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  telegram-bot:
+    image: ${BOT_IMAGE:-polymarket-arb-bot:local}
+    build:
+      context: .
+      args:
+        BIN: telegram-bot
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TELEGRAM_BACKEND_URL: http://detector:8080
+    depends_on:
+      detector:
+        condition: service_healthy
+
+volumes:
+  arb-data:

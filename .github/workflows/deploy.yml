@@ -1,0 +1,83 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        bin: [detector, telegram-bot]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.bin }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: BIN=${{ matrix.bin }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: img
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          sha="sha-${GITHUB_SHA::7}"
+          echo "detector=ghcr.io/${repo}/detector:${sha}" >> "$GITHUB_OUTPUT"
+          echo "bot=ghcr.io/${repo}/telegram-bot:${sha}" >> "$GITHUB_OUTPUT"
+      - name: Copy compose file to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: docker-compose.yml
+          target: ${{ secrets.VPS_PATH }}
+      - name: Pull & restart on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: DETECTOR_IMAGE,BOT_IMAGE,GHCR_ACTOR,GHCR_TOKEN
+          script: |
+            set -e
+            cd "${{ secrets.VPS_PATH }}"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
+            docker compose pull
+            docker compose up -d
+            docker image prune -f
+        env:
+          DETECTOR_IMAGE: ${{ steps.img.outputs.detector }}
+          BOT_IMAGE: ${{ steps.img.outputs.bot }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
