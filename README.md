@@ -219,7 +219,8 @@ detector's port is published only on `127.0.0.1`.
 |---|---|
 | `VPS_HOST` | VPS address |
 | `VPS_USER` | SSH user |
-| `VPS_SSH_KEY` | Private key for that user |
+| `VPS_SSH_KEY` | Private key for that user (no passphrase) |
+| `VPS_PORT` | SSH port (e.g. `22` or a custom one) |
 | `VPS_PATH` | Directory holding `docker-compose.yml` + `.env` |
 
 `GITHUB_TOKEN` is provided automatically and is used to push/pull GHCR images.
