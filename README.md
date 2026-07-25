@@ -71,7 +71,22 @@ Each opportunity is reported with the full economics so you can judge it before 
 - **Capital** — `max_capital` caps the assumed set size.
 
 An opportunity is flagged `profitable` only when `net_profit ≥ min_profit` after all of
-the above.
+the above. The reported **`avg_edge`** is the volume-weighted edge that actually clears at
+`size` (`(payout − cost − fees) / size`); it is the honest headline, while `gross_edge`
+(top of book only) is context.
+
+### Signal quality — why the feed is mostly empty
+
+Polymarket's YES and NO order books are **mirror images**: a buy order on YES at price `p`
+is the same object as a sell order on NO at `1 − p`, so at any coherent instant
+`ask_NO = 1 − bid_YES` and therefore `ask(YES) + ask(NO) = 1 + spread ≥ 1`. A persistent
+single-market YES/NO buy arb *cannot exist*; it only appears through genuine native
+crossing (gone in milliseconds) or, far more often, **stale/desynced snapshots** of the two
+legs. The detector therefore drops any snapshot that is internally impossible — a leg whose
+own book is crossed, or a snapshot showing a buy-set arb and a sell-set arb at the same time
+— and only fetches markets that are `active`, not `closed`, and `acceptingOrders`. After
+that filtering the feed is usually near-empty, which is correct: real set-arb on Polymarket
+is rare and fleeting.
 
 ### Practical analysis
 
@@ -179,11 +194,12 @@ the websocket immediately.
 | `/list` | Watched markets |
 | `/search <query>` | Find markets, returns tap-to-copy slugs |
 | `/settings` | Show alert filters |
-| `/set <key> <value>` | Tune alerts — keys: `enabled`, `only_profitable`, `min_edge`, `min_profit` |
+| `/set <key> <value>` | Tune alerts — keys: `enabled`, `only_profitable`, `min_edge`, `min_profit`, `crossings` |
 | `/mute`, `/unmute` | Pause / resume alerts |
 | `/top` | Current best opportunities |
+| `/crossings` | Recent micro-crossings and how long each was visible |
 | `/status` | Backend health (ws connected, watched/category counts) |
-| `/help`, `/start` | Usage |
+| `/help`, `/start` | Usage (shows the build's commit hash as `first…last`) |
 
 **Categories** are the main workflow: add one and the detector auto-pulls all its markets
 from Polymarket, re-checking every `discover_interval_secs` (default 5 min) to add new
@@ -202,6 +218,7 @@ a market re-alerts only when its edge improves by at least `realert_improvement`
 | `GET /health` | ws connection, watched count, last-update age |
 | `GET /config` | Effective arbitrage parameters |
 | `GET /opportunities` | Current opportunities (sorted by net profit) |
+| `GET /crossings?after_seq=&limit=` | Closed micro-crossings with lifetime and peak edge |
 | `GET /categories` | List tracked categories |
 | `POST /category` | Track a category — body `{"input":"<link\|slug\|condition_id>"}` |
 | `DELETE /category/:slug` | Stop tracking a category |

@@ -247,13 +247,24 @@ struct GammaMarket {
     outcomes: Option<String>,
     #[serde(rename = "enableOrderBook")]
     enable_order_book: Option<bool>,
+    #[serde(rename = "acceptingOrders")]
+    accepting_orders: Option<bool>,
+    closed: Option<bool>,
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
     #[serde(rename = "volumeNum")]
     volume_num: Option<f64>,
 }
 
 impl GammaMarket {
     fn into_market(self) -> Option<Market> {
-        if !self.enable_order_book.unwrap_or(false) {
+        // Only markets that are live and can actually take orders. This drops
+        // resolved/expired markets (e.g. finished hourly BTC up/down) whose frozen
+        // books would otherwise produce phantom, unexecutable arbs.
+        if !self.enable_order_book.unwrap_or(false)
+            || !self.accepting_orders.unwrap_or(true)
+            || self.closed.unwrap_or(false)
+        {
             return None;
         }
         let ids: Vec<String> = serde_json::from_str(self.clob_token_ids.as_deref()?).ok()?;
@@ -276,6 +287,7 @@ impl GammaMarket {
             yes_token: ids[yes_idx].clone(),
             no_token: ids[no_idx].clone(),
             volume: self.volume_num.unwrap_or(0.0),
+            end_date: self.end_date,
         })
     }
 }

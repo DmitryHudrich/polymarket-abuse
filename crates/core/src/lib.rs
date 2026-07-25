@@ -5,9 +5,13 @@
 //!
 //! A full set always redeems (or merges via the CTF) for exactly 1 USDC, so
 //! `ask(YES) + ask(NO) < 1` is a risk-free edge of `1 - sum` per set. The alert
-//! condition is therefore `sum < 1`, not `> 1`. The mirror case
-//! `bid(YES) + bid(NO) > 1` is a separate sell-side opportunity exposed via
-//! [`sell_side_edge`].
+//! condition is therefore `sum < 1`, not `> 1`.
+//!
+//! Note that Polymarket's YES and NO order books are mirror images
+//! (`ask_NO = 1 - bid_YES`), so on a single coherent snapshot `ask(YES)+ask(NO)`
+//! equals `1 + spread` and can only dip below 1 through genuine native crossing
+//! or — far more often — stale/desynced snapshots. Coherence filtering for that
+//! lives in the detector, not here.
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +70,10 @@ pub struct ArbResult {
     pub gas: f64,
     pub net_profit: f64,
     pub roi: f64,
+    /// Volume-weighted edge per set after sweeping both ladders and fees,
+    /// `(payout - cost - fees) / size`. Unlike `gross_edge` (top of book only)
+    /// this is what actually clears at `size`.
+    pub avg_edge: f64,
     pub profitable: bool,
 }
 
@@ -154,6 +162,7 @@ pub fn evaluate(yes_asks: &[Level], no_asks: &[Level], params: &ArbParams) -> Op
     } else {
         0.0
     };
+    let avg_edge = (payout - total_cost - total_fees) / total_size;
 
     Some(ArbResult {
         best_yes,
@@ -167,15 +176,9 @@ pub fn evaluate(yes_asks: &[Level], no_asks: &[Level], params: &ArbParams) -> Op
         gas,
         net_profit,
         roi,
+        avg_edge,
         profitable: net_profit >= params.min_profit && net_profit > 0.0,
     })
-}
-
-/// Gross edge of the mirror sell-side case, realizable only if a full set is
-/// already held. Returns `Some(edge)` when `bid_yes + bid_no > 1`.
-pub fn sell_side_edge(best_bid_yes: f64, best_bid_no: f64) -> Option<f64> {
-    let edge = best_bid_yes + best_bid_no - 1.0;
-    (edge > 0.0).then_some(edge)
 }
 
 #[cfg(test)]
@@ -193,7 +196,23 @@ mod tests {
         assert!((r.sum - 0.94).abs() < 1e-9);
         assert!((r.gross_edge - 0.06).abs() < 1e-9);
         assert!((r.net_profit - 6.0).abs() < 1e-6);
+        assert!((r.avg_edge - 0.06).abs() < 1e-9);
         assert!(r.profitable);
+    }
+
+    #[test]
+    fn avg_edge_below_gross_when_sweeping_worse_levels() {
+        // Top of book is 0.24+0.70=0.94 (gross 0.06), but half the size fills at
+        // 0.28+0.70=0.98, dragging the realized per-set edge to 0.04.
+        let r = evaluate(
+            &[Level::new(0.24, 50.0), Level::new(0.28, 50.0)],
+            &[Level::new(0.70, 100.0)],
+            &ArbParams::default(),
+        )
+        .unwrap();
+        assert!((r.size - 100.0).abs() < 1e-6);
+        assert!((r.avg_edge - 0.04).abs() < 1e-9);
+        assert!(r.avg_edge < r.gross_edge);
     }
 
     #[test]

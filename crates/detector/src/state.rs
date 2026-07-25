@@ -1,16 +1,47 @@
 //! Shared runtime state: the user-curated watchlist, live order books fed by
 //! the websocket, and the derived opportunities.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use arb_core::{evaluate, sell_side_edge, ArbResult, Level};
+use arb_core::{evaluate, ArbResult, Level};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::config::Config;
+
+/// How many closed micro-crossings to retain for `/crossings`.
+const CROSSING_LOG_CAP: usize = 500;
+
+/// A coherent buy-set arb (`ask_YES + ask_NO < 1`) currently open on a market —
+/// a "micro-crossing" of native liquidity through the mirror. Tracked so we can
+/// measure how long it stays visible.
+struct OpenCrossing {
+    opened: Instant,
+    opened_at: u64,
+    question: String,
+    market_url: String,
+    peak_avg_edge: f64,
+    peak_net: f64,
+    peak_size: f64,
+}
+
+/// A micro-crossing after it disappeared, with the lifetime it was visible.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClosedCrossing {
+    pub seq: u64,
+    pub condition_id: String,
+    pub question: String,
+    pub market_url: String,
+    pub lived_ms: u64,
+    pub peak_avg_edge: f64,
+    pub peak_net: f64,
+    pub peak_size: f64,
+    pub opened_at: u64,
+    pub closed_at: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
@@ -20,6 +51,8 @@ pub struct Market {
     pub yes_token: String,
     pub no_token: String,
     pub volume: f64,
+    #[serde(default)]
+    pub end_date: Option<String>,
 }
 
 impl Market {
@@ -88,6 +121,46 @@ impl LiveBook {
             .filter_map(|p| p.parse::<f64>().ok())
             .reduce(f64::max)
     }
+
+    pub fn best_ask(&self) -> Option<f64> {
+        self.asks
+            .keys()
+            .filter_map(|p| p.parse::<f64>().ok())
+            .reduce(f64::min)
+    }
+}
+
+/// A same-instant view of both legs used to sanity-check the data before
+/// treating a computed edge as real.
+struct BookSnap {
+    yes_asks: Vec<Level>,
+    no_asks: Vec<Level>,
+    yes_bid: Option<f64>,
+    yes_ask: Option<f64>,
+    no_bid: Option<f64>,
+    no_ask: Option<f64>,
+}
+
+impl BookSnap {
+    /// Reject snapshots that cannot exist on a live exchange, which on Polymarket
+    /// (where the YES and NO books are mirror images) means the two legs came
+    /// from different moments — the usual source of phantom arbs.
+    fn is_coherent(&self) -> bool {
+        let (Some(yb), Some(ya), Some(nb), Some(na)) =
+            (self.yes_bid, self.yes_ask, self.no_bid, self.no_ask)
+        else {
+            return false;
+        };
+        // Neither leg's own book may be crossed or locked.
+        if yb >= ya || nb >= na {
+            return false;
+        }
+        // A coherent instant cannot offer both a buy-set arb (asks sum < 1) and a
+        // sell-set arb (bids sum > 1) at once; both positive = desynced legs.
+        let buy_edge = 1.0 - (ya + na);
+        let sell_edge = (yb + nb) - 1.0;
+        !(buy_edge > 0.0 && sell_edge > 0.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,8 +172,8 @@ pub struct Opportunity {
     pub no_token: String,
     pub volume: f64,
     pub market_url: String,
+    pub end_date: Option<String>,
     pub arb: ArbResult,
-    pub sell_side_edge: Option<f64>,
     pub updated_at: u64,
 }
 
@@ -113,6 +186,9 @@ pub struct AppState {
     pub token_index: Arc<RwLock<HashMap<String, String>>>,
     pub books: Arc<RwLock<HashMap<String, LiveBook>>>,
     pub opps: Arc<RwLock<HashMap<String, Opportunity>>>,
+    crossings_open: Arc<RwLock<HashMap<String, OpenCrossing>>>,
+    crossings_log: Arc<RwLock<VecDeque<ClosedCrossing>>>,
+    crossing_seq: Arc<AtomicU64>,
     pub resubscribe: Arc<Notify>,
     pub ws_connected: Arc<AtomicBool>,
     pub last_update: Arc<AtomicU64>,
@@ -129,6 +205,9 @@ impl AppState {
             token_index: Default::default(),
             books: Default::default(),
             opps: Default::default(),
+            crossings_open: Default::default(),
+            crossings_log: Default::default(),
+            crossing_seq: Arc::new(AtomicU64::new(0)),
             resubscribe: Arc::new(Notify::new()),
             ws_connected: Arc::new(AtomicBool::new(false)),
             last_update: Arc::new(AtomicU64::new(0)),
@@ -280,24 +359,30 @@ impl AppState {
             }
         };
 
-        let (yes_asks, no_asks, bid_yes, bid_no) = {
+        let snap = {
             let books = self.books.read().await;
             let yes = books.get(&market.yes_token);
             let no = books.get(&market.no_token);
-            (
-                yes.map(LiveBook::asks).unwrap_or_default(),
-                no.map(LiveBook::asks).unwrap_or_default(),
-                yes.and_then(LiveBook::best_bid),
-                no.and_then(LiveBook::best_bid),
-            )
+            BookSnap {
+                yes_asks: yes.map(LiveBook::asks).unwrap_or_default(),
+                no_asks: no.map(LiveBook::asks).unwrap_or_default(),
+                yes_bid: yes.and_then(LiveBook::best_bid),
+                yes_ask: yes.and_then(LiveBook::best_ask),
+                no_bid: no.and_then(LiveBook::best_bid),
+                no_ask: no.and_then(LiveBook::best_ask),
+            }
         };
 
-        let now = now();
-        self.last_update.store(now, Ordering::Relaxed);
+        self.last_update.store(now(), Ordering::Relaxed);
 
-        match evaluate(&yes_asks, &no_asks, &self.cfg.arb) {
+        let arb = if snap.is_coherent() {
+            evaluate(&snap.yes_asks, &snap.no_asks, &self.cfg.arb)
+        } else {
+            None
+        };
+
+        match &arb {
             Some(arb) => {
-                let sse = bid_yes.zip(bid_no).and_then(|(y, n)| sell_side_edge(y, n));
                 let opp = Opportunity {
                     question: market.question.clone(),
                     slug: market.slug.clone(),
@@ -306,9 +391,9 @@ impl AppState {
                     no_token: market.no_token.clone(),
                     volume: market.volume,
                     market_url: market.market_url(),
-                    arb,
-                    sell_side_edge: sse,
-                    updated_at: now,
+                    end_date: market.end_date.clone(),
+                    arb: arb.clone(),
+                    updated_at: now(),
                 };
                 self.opps
                     .write()
@@ -319,6 +404,75 @@ impl AppState {
                 self.opps.write().await.remove(condition_id);
             }
         }
+
+        self.note_crossing(&market, arb.as_ref()).await;
+    }
+
+    /// Track the lifetime of a coherent buy-set arb. Called on every recompute:
+    /// an active arb opens/updates a crossing; its absence closes it and records
+    /// how long it was visible.
+    async fn note_crossing(&self, market: &Market, arb: Option<&ArbResult>) {
+        let mut open = self.crossings_open.write().await;
+        match arb {
+            Some(a) => {
+                let e = open
+                    .entry(market.condition_id.clone())
+                    .or_insert_with(|| OpenCrossing {
+                        opened: Instant::now(),
+                        opened_at: now(),
+                        question: market.question.clone(),
+                        market_url: market.market_url(),
+                        peak_avg_edge: f64::MIN,
+                        peak_net: f64::MIN,
+                        peak_size: 0.0,
+                    });
+                if a.avg_edge > e.peak_avg_edge {
+                    e.peak_avg_edge = a.avg_edge;
+                    e.peak_size = a.size;
+                }
+                e.peak_net = e.peak_net.max(a.net_profit);
+            }
+            None => {
+                if let Some(e) = open.remove(&market.condition_id) {
+                    let seq = self.crossing_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                    let closed = ClosedCrossing {
+                        seq,
+                        condition_id: market.condition_id.clone(),
+                        question: e.question,
+                        market_url: e.market_url,
+                        lived_ms: e.opened.elapsed().as_millis() as u64,
+                        peak_avg_edge: e.peak_avg_edge,
+                        peak_net: e.peak_net,
+                        peak_size: e.peak_size,
+                        opened_at: e.opened_at,
+                        closed_at: now(),
+                    };
+                    let mut log = self.crossings_log.write().await;
+                    log.push_back(closed);
+                    while log.len() > CROSSING_LOG_CAP {
+                        log.pop_front();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Closed crossings with `seq > after_seq`, oldest first, plus the newest seq
+    /// so the caller can poll incrementally.
+    pub async fn crossings_since(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> (u64, Vec<ClosedCrossing>) {
+        let log = self.crossings_log.read().await;
+        let last = self.crossing_seq.load(Ordering::Relaxed);
+        let items: Vec<ClosedCrossing> = log
+            .iter()
+            .filter(|c| c.seq > after_seq)
+            .take(limit)
+            .cloned()
+            .collect();
+        (last, items)
     }
 
     pub async fn conditions_for_tokens(&self, tokens: &[String]) -> HashSet<String> {
@@ -326,10 +480,6 @@ impl AppState {
         tokens.iter().filter_map(|t| idx.get(t).cloned()).collect()
     }
 
-    /// Persist the watchlist. Serialized by `persist_lock` so concurrent callers
-    /// never write the file at the same time, and the snapshot is taken *after*
-    /// acquiring the lock so the last writer always flushes the latest state.
-    /// Writes to a temp file and renames, so a reader never sees a torn file.
     /// Persist watched categories and pinned markets. Serialized by `persist_lock`
     /// so concurrent callers never write at once, with the snapshot taken after
     /// the lock so the last writer flushes the latest state; written to a temp
@@ -372,6 +522,16 @@ impl AppState {
             tracing::info!(
                 "loaded {} categories, {} pinned markets from {}",
                 self.categories.read().await.len(),
+                self.manual.read().await.len(),
+                path.display()
+            );
+        } else if let Ok(markets) = serde_json::from_slice::<Vec<Market>>(&bytes) {
+            // Backward compatibility with the pre-category file format.
+            for m in markets {
+                self.add_manual_market(m).await;
+            }
+            tracing::info!(
+                "migrated {} markets from legacy {}",
                 self.manual.read().await.len(),
                 path.display()
             );

@@ -23,6 +23,9 @@ struct Settings {
     only_profitable: bool,
     min_edge: f64,
     min_profit: f64,
+    /// Push a message each time a micro-crossing closes, with how long it lived.
+    #[serde(default)]
+    crossings: bool,
 }
 
 impl Settings {
@@ -32,8 +35,27 @@ impl Settings {
             only_profitable: cfg.only_profitable,
             min_edge: cfg.alert_min_edge,
             min_profit: cfg.alert_min_profit,
+            crossings: false,
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Crossing {
+    question: String,
+    market_url: String,
+    lived_ms: u64,
+    peak_avg_edge: f64,
+    peak_net: f64,
+    peak_size: f64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CrossingsResponse {
+    #[serde(default)]
+    last_seq: u64,
+    #[serde(default)]
+    crossings: Vec<Crossing>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -48,6 +70,8 @@ struct Arb {
     gas: f64,
     net_profit: f64,
     roi: f64,
+    #[serde(default)]
+    avg_edge: f64,
     profitable: bool,
 }
 
@@ -57,8 +81,9 @@ struct Opportunity {
     condition_id: String,
     volume: f64,
     market_url: String,
+    #[serde(default)]
+    end_date: Option<String>,
     arb: Arb,
-    sell_side_edge: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,9 +135,10 @@ async fn main() -> Result<()> {
     tracing::info!(backend = %bot.cfg.backend_url, "telegram alerter started");
 
     let alerter = tokio::spawn(alert_loop(bot.clone()));
+    let crossings = tokio::spawn(crossings_loop(bot.clone()));
     let commands = tokio::spawn(command_loop(bot.clone()));
 
-    let _ = tokio::try_join!(alerter, commands)?;
+    let _ = tokio::try_join!(alerter, crossings, commands)?;
     Ok(())
 }
 
@@ -163,6 +189,42 @@ async fn alert_loop(bot: Arc<Bot>) {
     }
 }
 
+async fn crossings_loop(bot: Arc<Bot>) {
+    if bot.cfg.chat_id.is_empty() {
+        return;
+    }
+    let mut last_seq = u64::MAX; // MAX = uninitialized; first poll just syncs the cursor
+    let mut ticker = tokio::time::interval(Duration::from_secs(bot.cfg.poll_interval_secs.max(1)));
+    loop {
+        ticker.tick().await;
+        let after = if last_seq == u64::MAX { 0 } else { last_seq };
+        let resp = match bot.fetch_crossings(after, 200).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("crossings poll failed: {e}");
+                continue;
+            }
+        };
+        let first_run = last_seq == u64::MAX;
+        last_seq = resp.last_seq;
+        if first_run {
+            continue; // don't replay the backlog that existed before we started
+        }
+        let s = bot.settings.read().await.clone();
+        if !s.enabled || !s.crossings {
+            continue;
+        }
+        for c in &resp.crossings {
+            if c.peak_avg_edge < s.min_edge {
+                continue;
+            }
+            if let Err(e) = bot.send(&bot.cfg.chat_id, &format_crossing(c)).await {
+                tracing::warn!("send crossing failed: {e}");
+            }
+        }
+    }
+}
+
 async fn command_loop(bot: Arc<Bot>) {
     let mut offset: i64 = 0;
     loop {
@@ -206,13 +268,47 @@ impl Bot {
         Ok(r)
     }
 
+    async fn fetch_crossings(&self, after_seq: u64, limit: usize) -> Result<CrossingsResponse> {
+        let url = format!(
+            "{}/crossings?after_seq={after_seq}&limit={limit}",
+            self.cfg.backend_url
+        );
+        let r = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("crossings request failed")?
+            .error_for_status()
+            .context("crossings error status")?
+            .json()
+            .await
+            .context("crossings decode failed")?;
+        Ok(r)
+    }
+
+    async fn cmd_crossings(&self) -> String {
+        match self.fetch_crossings(0, 500).await {
+            Ok(r) if !r.crossings.is_empty() => {
+                let mut s = String::from("<b>Recent micro-crossings</b>\n\n");
+                for c in r.crossings.iter().rev().take(10) {
+                    s.push_str(&format_crossing(c));
+                    s.push_str("\n\n");
+                }
+                s
+            }
+            Ok(_) => "No micro-crossings recorded yet.".to_string(),
+            Err(e) => format!("backend unreachable: {}", esc(&e.to_string())),
+        }
+    }
+
     async fn handle_command(&self, text: &str) -> Option<String> {
         let mut parts = text.splitn(2, char::is_whitespace);
         let raw = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
         let cmd = raw.split('@').next().unwrap_or(raw);
         match cmd {
-            "/start" | "/help" => Some(HELP.to_string()),
+            "/start" | "/help" => Some(format!("{HELP}{}", version_line())),
             "/status" => Some(self.status_text().await),
             "/top" => Some(self.top_text().await),
             "/add" => Some(self.cmd_add(arg).await),
@@ -222,6 +318,7 @@ impl Bot {
             "/add_category" | "/addcategory" => Some(self.cmd_add_category(arg).await),
             "/remove_category" | "/removecategory" => Some(self.cmd_remove_category(arg).await),
             "/categories" => Some(self.cmd_categories().await),
+            "/crossings" => Some(self.cmd_crossings().await),
             "/settings" => Some(self.cmd_settings().await),
             "/set" => Some(self.cmd_set(arg).await),
             "/mute" => Some(self.cmd_toggle(false).await),
@@ -309,11 +406,12 @@ impl Bot {
              enabled: <b>{}</b>\n\
              only_profitable: <b>{}</b>\n\
              min_edge: <b>{}</b>\n\
-             min_profit: <b>${}</b>\n\n\
+             min_profit: <b>${}</b>\n\
+             crossings: <b>{}</b>\n\n\
              Change with: /set &lt;key&gt; &lt;value&gt;\n\
-             keys: enabled, only_profitable, min_edge, min_profit\n\
+             keys: enabled, only_profitable, min_edge, min_profit, crossings\n\
              or /mute /unmute",
-            s.enabled, s.only_profitable, s.min_edge, s.min_profit
+            s.enabled, s.only_profitable, s.min_edge, s.min_profit, s.crossings
         )
     }
 
@@ -328,11 +426,12 @@ impl Bot {
             "only_profitable" => parse_bool(val).map(|b| s.only_profitable = b),
             "min_edge" => val.parse::<f64>().ok().map(|v| s.min_edge = v),
             "min_profit" => val.parse::<f64>().ok().map(|v| s.min_profit = v),
+            "crossings" => parse_bool(val).map(|b| s.crossings = b),
             _ => {
                 return format!(
-                    "Unknown key '{}'. Keys: enabled, only_profitable, min_edge, min_profit",
-                    esc(key)
-                )
+                "Unknown key '{}'. Keys: enabled, only_profitable, min_edge, min_profit, crossings",
+                esc(key)
+            )
             }
         };
         if result.is_none() {
@@ -559,34 +658,57 @@ impl Bot {
 
 fn format_alert(o: &Opportunity) -> String {
     let a = &o.arb;
-    let mut s = format!(
+    // Headline is the volume-weighted edge that actually clears at `size`; the
+    // top-of-book edge is shown separately and only as context.
+    let resolves = o
+        .end_date
+        .as_deref()
+        .map(|d| {
+            format!(
+                "\nresolves: <code>{}</code> (locked until then unless you merge)",
+                esc(d)
+            )
+        })
+        .unwrap_or_default();
+    format!(
         "🟢 <b>YES+NO arbitrage</b>\n<b>{q}</b>\n\n\
-         YES ask: <code>{yes:.4}</code>  NO ask: <code>{no:.4}</code>\n\
-         sum: <code>{sum:.4}</code>  edge: <code>{edge:.4}</code>\n\
-         size: <code>{size:.1}</code> sets  cost: <code>${cost:.2}</code>\n\
-         fees: <code>${fees:.2}</code>  gas: <code>${gas:.2}</code>\n\
+         effective edge: <b>{avg:.3}</b> per set on <b>{size:.0}</b> sets\n\
          net profit: <b>${net:.2}</b>  roi: <b>{roi:.2}%</b>\n\
-         volume: <code>${vol:.0}</code>\n{url}",
+         cost: <code>${cost:.2}</code>  fees: <code>${fees:.2}</code>  gas: <code>${gas:.2}</code>\n\
+         top of book: YES <code>{yes:.4}</code> + NO <code>{no:.4}</code> = <code>{sum:.4}</code> (edge {edge:.4})\n\
+         volume: <code>${vol:.0}</code>{resolves}\n\
+         <a href=\"{url}\">open market</a>",
         q = esc(&o.question),
+        avg = a.avg_edge,
+        size = a.size,
+        net = a.net_profit,
+        roi = a.roi * 100.0,
+        cost = a.cost,
+        fees = a.fees,
+        gas = a.gas,
         yes = a.best_yes,
         no = a.best_no,
         sum = a.sum,
         edge = a.gross_edge,
-        size = a.size,
-        cost = a.cost,
-        fees = a.fees,
-        gas = a.gas,
-        net = a.net_profit,
-        roi = a.roi * 100.0,
         vol = o.volume,
+        resolves = resolves,
         url = esc(&o.market_url),
-    );
-    if let Some(sse) = o.sell_side_edge {
-        s.push_str(&format!(
-            "\n↔️ sell-side edge (bid YES+NO−1): <code>{sse:.4}</code>"
-        ));
-    }
-    s
+    )
+}
+
+fn format_crossing(c: &Crossing) -> String {
+    format!(
+        "⚡ <b>Micro-crossing</b>\n<b>{q}</b>\n\
+         lived <b>{ms} ms</b>  peak edge <b>{edge:.3}</b>\n\
+         size <code>{size:.0}</code>  would-be net <code>${net:.2}</code>\n\
+         <a href=\"{url}\">open market</a>",
+        q = esc(&c.question),
+        ms = c.lived_ms,
+        edge = c.peak_avg_edge,
+        size = c.peak_size,
+        net = c.peak_net,
+        url = esc(&c.market_url),
+    )
 }
 
 fn esc(s: &str) -> String {
@@ -619,6 +741,17 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
+/// Short build identity for `/help`: first and last 4 chars of the commit hash.
+fn version_line() -> String {
+    let h = env!("GIT_HASH");
+    let short = if h.len() >= 8 {
+        format!("{}…{}", &h[..4], &h[h.len() - 4..])
+    } else {
+        h.to_string()
+    };
+    format!("\n\n<i>build {short}</i>")
+}
+
 fn parse_bool(v: &str) -> Option<bool> {
     match v.to_ascii_lowercase().as_str() {
         "true" | "on" | "yes" | "1" => Some(true),
@@ -647,10 +780,11 @@ Paste a Polymarket link, or:\n\
 /add &lt;link|slug&gt; · /remove &lt;slug&gt; · /list · /search &lt;query&gt;\n\n\
 <b>Notifications</b>\n\
 /settings — show alert filters\n\
-/set &lt;key&gt; &lt;value&gt; — keys: enabled, only_profitable, min_edge, min_profit\n\
+/set &lt;key&gt; &lt;value&gt; — keys: enabled, only_profitable, min_edge, min_profit, crossings\n\
 /mute · /unmute\n\n\
 <b>Info</b>\n\
 /top — current best opportunities\n\
+/crossings — recent micro-crossings and how long they lived\n\
 /status — backend health";
 
 #[derive(Debug, Deserialize)]

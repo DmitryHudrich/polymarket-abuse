@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/config", get(get_config))
         .route("/opportunities", get(list_opportunities))
+        .route("/crossings", get(crossings))
         .route("/watch", get(list_watch).post(add_watch))
         .route("/watch/:key", delete(remove_watch))
         .route("/categories", get(list_categories))
@@ -219,6 +220,27 @@ async fn list_categories(State(app): State<App>) -> Json<serde_json::Value> {
         .map(|c| serde_json::json!({ "slug": c.slug, "label": c.label, "tag_id": c.tag_id }))
         .collect();
     Json(serde_json::json!({ "count": items.len(), "categories": items }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossingsQuery {
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn crossings(
+    State(app): State<App>,
+    Query(q): Query<CrossingsQuery>,
+) -> Json<serde_json::Value> {
+    let (last_seq, items) = app
+        .state
+        .crossings_since(q.after_seq.unwrap_or(0), q.limit.unwrap_or(50))
+        .await;
+    Json(serde_json::json!({
+        "last_seq": last_seq,
+        "count": items.len(),
+        "crossings": items,
+    }))
 }
 
 async fn list_watch(State(app): State<App>) -> Json<serde_json::Value> {

@@ -14,6 +14,8 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 ARG BIN
+ARG GIT_SHA
+ENV GIT_SHA=${GIT_SHA}
 RUN cargo build --release --bin "$BIN" && cp "target/release/$BIN" /app/service
 
 FROM debian:bookworm-slim AS runtime
