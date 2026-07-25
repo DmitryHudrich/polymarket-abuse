@@ -35,6 +35,10 @@ fn now() -> u64 {
         .as_secs()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Runtime-tunable alert filters, changed from chat via `/set` and persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
@@ -45,6 +49,13 @@ struct Settings {
     /// Push a message each time a micro-crossing closes, with how long it lived.
     #[serde(default)]
     crossings: bool,
+    /// Alert on buy-set arbs: `ask(YES) + ask(NO) < 1`, merge the set for $1.
+    #[serde(default = "default_true")]
+    mint: bool,
+    /// Alert on split-and-sell arbs: split $1 into a set, sell both legs into
+    /// bids summing above $1.
+    #[serde(default = "default_true")]
+    split: bool,
 }
 
 impl Settings {
@@ -55,6 +66,16 @@ impl Settings {
             min_edge: cfg.alert_min_edge,
             min_profit: cfg.alert_min_profit,
             crossings: false,
+            mint: true,
+            split: true,
+        }
+    }
+
+    /// Whether alerts for this strategy are switched on.
+    fn allows(&self, strategy: &str) -> bool {
+        match strategy {
+            "split" => self.split,
+            _ => self.mint,
         }
     }
 }
@@ -63,10 +84,16 @@ impl Settings {
 struct Crossing {
     question: String,
     market_url: String,
+    #[serde(default = "mint_strategy")]
+    strategy: String,
     lived_ms: u64,
     peak_avg_edge: f64,
     peak_net: f64,
     peak_size: f64,
+}
+
+fn mint_strategy() -> String {
+    "mint".to_string()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -79,12 +106,16 @@ struct CrossingsResponse {
 
 #[derive(Debug, Deserialize, Clone)]
 struct Arb {
+    #[serde(default = "mint_strategy")]
+    strategy: String,
     best_yes: f64,
     best_no: f64,
     sum: f64,
     gross_edge: f64,
     size: f64,
     cost: f64,
+    #[serde(default)]
+    payout: f64,
     fees: f64,
     gas: f64,
     net_profit: f64,
@@ -196,14 +227,19 @@ async fn alert_loop(bot: Arc<Bot>) {
 
         let mut seen = seen.lock().await;
         for o in &resp.opportunities {
+            if !s.allows(&o.arb.strategy) {
+                continue;
+            }
             if s.only_profitable && !o.arb.profitable {
                 continue;
             }
             if o.arb.gross_edge < s.min_edge || o.arb.net_profit < s.min_profit {
                 continue;
             }
-            let prev = seen.get(&o.condition_id).copied();
-            let fresh = match prev {
+            // Both directions can be live on the same market, so the re-alert
+            // memory is keyed per strategy, not per market.
+            let key = format!("{}:{}", o.condition_id, o.arb.strategy);
+            let fresh = match seen.get(&key).copied() {
                 None => true,
                 Some(p) => o.arb.gross_edge - p >= bot.cfg.realert_improvement,
             };
@@ -213,7 +249,7 @@ async fn alert_loop(bot: Arc<Bot>) {
             if let Err(e) = bot.send(&bot.cfg.chat_id, &format_alert(o)).await {
                 tracing::warn!("send alert failed: {e}");
             } else {
-                seen.insert(o.condition_id.clone(), o.arb.gross_edge);
+                seen.insert(key, o.arb.gross_edge);
             }
         }
     }
@@ -245,7 +281,7 @@ async fn crossings_loop(bot: Arc<Bot>) {
             continue;
         }
         for c in &resp.crossings {
-            if c.peak_avg_edge < s.min_edge {
+            if !s.allows(&c.strategy) || c.peak_avg_edge < s.min_edge {
                 continue;
             }
             if let Err(e) = bot.send(&bot.cfg.chat_id, &format_crossing(c)).await {
@@ -638,7 +674,9 @@ impl Bot {
         let global = v["arb"]["fee_bps"].as_f64().unwrap_or(0.0);
         s.push_str(&format!(
             "\nfallback (uncategorised): <b>{global:.0}</b>\n\
-             <i>Both arb legs are takers, so a set pays both.</i>"
+             <i>Both legs are takers in either direction (buy YES+NO, or sell both \
+             after a split), so a set always pays two taker fees. The fee peaks at \
+             price 0.50 and fades toward the tails.</i>"
         ));
         s
     }
@@ -651,18 +689,20 @@ impl Bot {
              only_profitable: <b>{}</b>\n\
              min_edge: <b>{}</b>\n\
              min_profit: <b>${}</b>\n\
-             crossings: <b>{}</b>\n\n\
+             crossings: <b>{}</b>\n\
+             mint (asks &lt; $1): <b>{}</b>\n\
+             split (bids &gt; $1): <b>{}</b>\n\n\
              Change with: /set &lt;key&gt; &lt;value&gt;\n\
-             keys: enabled, only_profitable, min_edge, min_profit, crossings\n\
+             keys: enabled, only_profitable, min_edge, min_profit, crossings, mint, split\n\
              or /mute /unmute",
-            s.enabled, s.only_profitable, s.min_edge, s.min_profit, s.crossings
+            s.enabled, s.only_profitable, s.min_edge, s.min_profit, s.crossings, s.mint, s.split
         )
     }
 
     async fn cmd_set(&self, arg: &str) -> String {
         let mut it = arg.split_whitespace();
         let (Some(key), Some(val)) = (it.next(), it.next()) else {
-            return "Usage: /set &lt;key&gt; &lt;value&gt; (keys: enabled, only_profitable, min_edge, min_profit)".into();
+            return format!("Usage: /set &lt;key&gt; &lt;value&gt; (keys: {SET_KEYS})");
         };
         let mut s = self.settings.write().await;
         let result = match key {
@@ -671,12 +711,9 @@ impl Bot {
             "min_edge" => val.parse::<f64>().ok().map(|v| s.min_edge = v),
             "min_profit" => val.parse::<f64>().ok().map(|v| s.min_profit = v),
             "crossings" => parse_bool(val).map(|b| s.crossings = b),
-            _ => {
-                return format!(
-                "Unknown key '{}'. Keys: enabled, only_profitable, min_edge, min_profit, crossings",
-                esc(key)
-            )
-            }
+            "mint" => parse_bool(val).map(|b| s.mint = b),
+            "split" => parse_bool(val).map(|b| s.split = b),
+            _ => return format!("Unknown key '{}'. Keys: {SET_KEYS}", esc(key)),
         };
         if result.is_none() {
             return format!("Bad value '{}' for {}.", esc(val), esc(key));
@@ -830,21 +867,18 @@ impl Bot {
                 .unwrap_or(0),
             None => 0,
         };
-        let opp_count = self
-            .fetch_opportunities()
-            .await
-            .map(|r| r.opportunities.len())
-            .unwrap_or(0);
         format!(
             "<b>Backend status</b>\n\
              ws_connected: <b>{}</b>\n\
              watched markets: <b>{}</b>\n\
              categories: <b>{}</b>\n\
-             live opportunities: <b>{}</b>",
+             live mint arbs (asks &lt; $1): <b>{}</b>\n\
+             live split arbs (bids &gt; $1): <b>{}</b>",
             health["ws_connected"].as_bool().unwrap_or(false),
             health["watched"].as_u64().unwrap_or(0),
             cat_count,
-            opp_count,
+            health["mint_opportunities"].as_u64().unwrap_or(0),
+            health["split_opportunities"].as_u64().unwrap_or(0),
         )
     }
 
@@ -905,11 +939,34 @@ impl Bot {
 
 fn format_alert(o: &Opportunity) -> String {
     let a = &o.arb;
+    let split = a.strategy == "split";
     // Headline is the volume-weighted edge that actually clears at `size`; the
     // top-of-book edge is shown separately and only as context.
+    let (header, plan, book_label) = if split {
+        (
+            "🔵 <b>Split &amp; sell</b> (bids &gt; $1)",
+            format!(
+                "plan: split <code>${:.2}</code> into {:.0} sets, sell both legs as taker for <code>${:.2}</code>",
+                a.cost, a.size, a.payout
+            ),
+            "best bids",
+        )
+    } else {
+        (
+            "🟢 <b>YES+NO arbitrage</b> (asks &lt; $1)",
+            format!(
+                "plan: buy {:.0} sets for <code>${:.2}</code>, merge back into <code>${:.2}</code>",
+                a.size, a.cost, a.payout
+            ),
+            "best asks",
+        )
+    };
+    // The split leg closes the same instant it opens, so there is nothing to sit
+    // on until resolution — the note only applies to the buy-and-merge side.
     let resolves = o
         .end_date
         .as_deref()
+        .filter(|_| !split)
         .map(|d| {
             format!(
                 "\nresolves: <code>{}</code> (locked until then unless you merge)",
@@ -918,21 +975,24 @@ fn format_alert(o: &Opportunity) -> String {
         })
         .unwrap_or_default();
     format!(
-        "🟢 <b>YES+NO arbitrage</b>\n<b>{q}</b>\n\n\
+        "{header}\n<b>{q}</b>\n\n\
          effective edge: <b>{avg:.3}</b> per set on <b>{size:.0}</b> sets\n\
          net profit: <b>${net:.2}</b>  roi: <b>{roi:.2}%</b>\n\
-         cost: <code>${cost:.2}</code>  fees: <code>${fees:.2}</code>  gas: <code>${gas:.2}</code>\n\
-         top of book: YES <code>{yes:.4}</code> + NO <code>{no:.4}</code> = <code>{sum:.4}</code> (edge {edge:.4})\n\
+         {plan}\n\
+         fees: <code>${fees:.2}</code> (2 taker legs)  gas: <code>${gas:.2}</code>\n\
+         {book_label}: YES <code>{yes:.4}</code> + NO <code>{no:.4}</code> = <code>{sum:.4}</code> (edge {edge:.4})\n\
          volume: <code>${vol:.0}</code>{resolves}\n\
          <a href=\"{url}\">open market</a>",
+        header = header,
         q = esc(&o.question),
         avg = a.avg_edge,
         size = a.size,
         net = a.net_profit,
         roi = a.roi * 100.0,
-        cost = a.cost,
+        plan = plan,
         fees = a.fees,
         gas = a.gas,
+        book_label = book_label,
         yes = a.best_yes,
         no = a.best_no,
         sum = a.sum,
@@ -944,11 +1004,17 @@ fn format_alert(o: &Opportunity) -> String {
 }
 
 fn format_crossing(c: &Crossing) -> String {
+    let direction = if c.strategy == "split" {
+        "split &amp; sell"
+    } else {
+        "buy set"
+    };
     format!(
-        "⚡ <b>Micro-crossing</b>\n<b>{q}</b>\n\
+        "⚡ <b>Micro-crossing</b> ({direction})\n<b>{q}</b>\n\
          lived <b>{ms} ms</b>  peak edge <b>{edge:.3}</b>\n\
          size <code>{size:.0}</code>  would-be net <code>${net:.2}</code>\n\
          <a href=\"{url}\">open market</a>",
+        direction = direction,
         q = esc(&c.question),
         ms = c.lived_ms,
         edge = c.peak_avg_edge,
@@ -1022,9 +1088,15 @@ fn load_archive(path: &std::path::Path) -> Vec<ArchivedItem> {
     }
 }
 
+/// Keys accepted by `/set`, kept in one place so usage and errors agree.
+const SET_KEYS: &str = "enabled, only_profitable, min_edge, min_profit, crossings, mint, split";
+
 const HELP: &str = "<b>Polymarket YES/NO arbitrage alerter</b>\n\n\
-Alerts fire only when a full set (YES+NO) can be bought below $1. \
-This bot never places orders.\n\n\
+Two directions, both alert-only — this bot never places orders:\n\
+🟢 <b>mint</b> — asks sum below $1: buy YES+NO, merge the set back into $1\n\
+🔵 <b>split</b> — bids sum above $1: split $1 into a set, sell both legs\n\
+Both legs are takers in either direction, so both taker fees and CTF gas are \
+already subtracted from the net profit shown.\n\n\
 <b>Categories</b> (auto-tracked, refreshed every few minutes)\n\
 /add_category &lt;link|slug&gt; — track a whole category (e.g. polymarket.com/iran)\n\
 /remove_category &lt;slug&gt; — stop tracking it\n\
@@ -1035,7 +1107,7 @@ Paste a Polymarket link, or:\n\
 /add &lt;link|slug&gt; · /remove &lt;slug&gt; · /list · /search &lt;query&gt;\n\n\
 <b>Notifications</b>\n\
 /settings — show alert filters\n\
-/set &lt;key&gt; &lt;value&gt; — keys: enabled, only_profitable, min_edge, min_profit, crossings\n\
+/set &lt;key&gt; &lt;value&gt; — keys: enabled, only_profitable, min_edge, min_profit, crossings, mint, split\n\
 /mute · /unmute\n\n\
 <b>Info</b>\n\
 /top — quick summary of current opportunities\n\

@@ -85,6 +85,9 @@ struct ListQuery {
     profitable: Option<bool>,
     min_edge: Option<f64>,
     min_profit: Option<f64>,
+    /// "mint" (buy set below $1) or "split" (mint a set, sell both bids above
+    /// $1). Omitted returns both.
+    strategy: Option<String>,
     limit: Option<usize>,
 }
 
@@ -92,9 +95,14 @@ async fn list_opportunities(
     State(app): State<App>,
     Query(q): Query<ListQuery>,
 ) -> Json<serde_json::Value> {
-    let opps = app.state.opps.read().await;
+    let opps = app.state.all_opportunities().await;
     let mut items: Vec<_> = opps
-        .values()
+        .iter()
+        .filter(|o| {
+            q.strategy
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(o.arb.strategy.as_str()))
+        })
         .filter(|o| q.profitable.is_none_or(|p| o.arb.profitable == p))
         .filter(|o| q.min_edge.is_none_or(|e| o.arb.gross_edge >= e))
         .filter(|o| q.min_profit.is_none_or(|p| o.arb.net_profit >= p))
@@ -300,6 +308,8 @@ async fn health(State(app): State<App>) -> Json<serde_json::Value> {
         "status": "ok",
         "ws_connected": app.state.ws_connected.load(Ordering::Relaxed),
         "watched": app.state.list_markets().await.len(),
+        "mint_opportunities": app.state.opps.read().await.len(),
+        "split_opportunities": app.state.split_opps.read().await.len(),
         "last_update": last,
         "age_secs": age,
     }))

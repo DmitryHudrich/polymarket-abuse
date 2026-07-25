@@ -1,6 +1,7 @@
 # Polymarket YES/NO arbitrage alerter
 
-Alerts-only tooling for the classic Polymarket YES/NO mint arbitrage. It **detects**
+Alerts-only tooling for the Polymarket YES/NO set arbitrage, in both directions — buy a
+set below $1 and merge it, or split $1 into a set and sell it above $1. It **detects**
 opportunities and **notifies** you; it never signs, funds, or places an order. Two
 independent binaries:
 
@@ -42,36 +43,49 @@ separate order books, so their prices are set by supply and demand, not by the i
 `redeem` after resolution, or immediately via the Conditional Tokens Framework
 `mergePositions`, which burns a matched set back into 1 USDC without waiting.
 
-That gives a risk-free edge whenever both legs can be **bought** below par:
+A set is also **mintable** on demand: `splitPosition` turns 1 USDC into 1 YES + 1 NO. So
+par can be arbitraged from either side, and the detector alerts on both directions:
 
 ```
-ask(YES) + ask(NO) < 1   →   buy both   →   redeem/merge for 1   →   profit = 1 − sum
+mint   ask(YES) + ask(NO) < 1  →  buy both legs      →  merge/redeem for 1  →  edge = 1 − sum
+split  bid(YES) + bid(NO) > 1  →  split 1 into a set →  sell both legs      →  edge = sum − 1
 ```
 
-Worked example (from the brief): YES ask `0.24`, NO ask `0.70`. Sum is `0.94`, so a set
-costs `0.94` and settles to `1.00` regardless of outcome — profit `0.06` per set.
+Worked examples: YES ask `0.24`, NO ask `0.70` — a set costs `0.94` and settles to `1.00`
+regardless of outcome, `0.06` per set (**mint**). Or YES bid `0.29`, NO bid `0.72` — mint a
+set for `1.00` and dump both legs for `1.01`, `0.01` per set (**split**).
 
-> **Trigger direction.** The alert condition is `ask(YES) + ask(NO) < 1`, i.e. **sum below
-> 1**, not above. `bid(YES) + bid(NO) > 1` is the *mirror* case, realizable only if you
-> already hold a set to sell/merge; the detector surfaces it as an informational
-> `sell_side_edge` field, but the primary alert is the buy-both case.
+> **Both directions are taker-on-both-legs**, so both pay two taker fees and one CTF gas
+> leg. That matters most for **split**: its gross edge is typically 1–2¢ while two taker
+> fees on a mid-priced market run well past that, so the split feed is almost entirely
+> gated by fees. Free categories (geopolitics/world, `0` bps) are where thin split edges
+> actually survive. Alerts for either direction can be switched off from chat
+> (`/set mint off`, `/set split off`).
 
 ### Does it clear costs?
 
 Each opportunity is reported with the full economics so you can judge it before acting:
 
-- **Order-book depth** — the engine sweeps both ask ladders together and stacks sets only
-  while the *marginal* set stays below 1, so `size`/`cost`/`net_profit` reflect real
-  executable depth, not just top-of-book.
+- **Order-book depth** — the engine sweeps both ladders together (asks for **mint**, bids
+  for **split**) and stacks sets only while the *marginal* set still clears par after its
+  own fee, so `size`/`cost`/`net_profit` reflect real executable depth, not just
+  top-of-book. This is where a headline 1¢ split edge usually collapses: the best bid is
+  good for a handful of shares and the next level is already through par.
 - **Fees** — Polymarket's Fee Structure V2 taker fee, applied per side as
-  `fee_bps/10000 · min(price, 1−price) · shares`. Both arb legs take liquidity, so both
-  pay. Per-category rates (`category_fee_bps`, e.g. crypto `350` = $1.75/100 shares at
-  price 0.50, sports `250`, geopolitics `0`) are assigned to each market at discovery;
-  manual/uncategorised markets fall back to the global `fee_bps`.
-- **Slippage** — `slippage_bps` pads each buy price.
-- **Gas** — `gas_cost`, the fixed USDC cost of the closing `merge`/`redeem`, subtracted
-  from net profit; it is what kills thin edges on small size.
-- **Capital** — `max_capital` caps the assumed set size.
+  `fee_bps/10000 · min(price, 1−price) · shares`. Both legs take liquidity in either
+  direction, so both pay. Per-category rates (`category_fee_bps`, e.g. crypto `350` =
+  $1.75/100 shares at price 0.50, sports `250`, geopolitics `0`) are assigned to each
+  market at discovery; manual/uncategorised markets fall back to the global `fee_bps`.
+  Because the fee peaks at 0.50 and fades toward the tails, an off-center market pays much
+  less on its cheap leg than on its dear one.
+- **Slippage** — `slippage_bps` pads each buy price and haircuts each sell price.
+- **Gas** — `gas_cost`, the fixed USDC cost of the CTF leg (`merge`/`redeem` for **mint**,
+  `splitPosition` for **split**), subtracted from net profit; it is what kills thin edges
+  on small size. Note that ordinary CLOB trading is relayed and effectively gasless, while
+  a direct `splitPosition` call is not necessarily subsidised — set this to a real number
+  before trusting a small-size split alert.
+- **Capital** — `max_capital` caps the assumed set size. For **split** it caps sets
+  directly, since minting a set always costs exactly $1.
 
 An opportunity is flagged `profitable` only when `net_profit ≥ min_profit` after all of
 the above. The reported **`avg_edge`** is the volume-weighted edge that actually clears at
@@ -82,14 +96,15 @@ the above. The reported **`avg_edge`** is the volume-weighted edge that actually
 
 Polymarket's YES and NO order books are **mirror images**: a buy order on YES at price `p`
 is the same object as a sell order on NO at `1 − p`, so at any coherent instant
-`ask_NO = 1 − bid_YES` and therefore `ask(YES) + ask(NO) = 1 + spread ≥ 1`. A persistent
-single-market YES/NO buy arb *cannot exist*; it only appears through genuine native
-crossing (gone in milliseconds) or, far more often, **stale/desynced snapshots** of the two
-legs. The detector therefore drops any snapshot that is internally impossible — a leg whose
-own book is crossed, or a snapshot showing a buy-set arb and a sell-set arb at the same time
-— and only fetches markets that are `active`, not `closed`, and `acceptingOrders`. After
-that filtering the feed is usually near-empty, which is correct: real set-arb on Polymarket
-is rare and fleeting.
+`ask_NO = 1 − bid_YES`, and therefore `ask(YES) + ask(NO) = 1 + spread ≥ 1` while
+`bid(YES) + bid(NO) = 1 − spread ≤ 1`. Neither a persistent buy-set arb nor a persistent
+sell-set arb *can exist*; either only appears through genuine native crossing (gone in
+milliseconds) or, far more often, **stale/desynced snapshots** of the two legs. The
+detector therefore drops any snapshot that is internally impossible — a leg whose own book
+is crossed, or a snapshot showing a buy-set arb and a sell-set arb at the same time — and
+only fetches markets that are `active`, not `closed`, and `acceptingOrders`. After that
+filtering the feed is usually near-empty, which is correct: real set-arb on Polymarket is
+rare and fleeting.
 
 ### Practical analysis
 
@@ -105,9 +120,15 @@ is rare and fleeting.
 - **Merge vs. wait.** You need not wait for resolution: buy the set, then `mergePositions`
   on Polygon to realize 1 USDC immediately — removing oracle/resolution risk but adding a
   gas leg (`gas_cost`).
+- **Taker vs. maker on the split.** The split alert assumes you *hit* the resting bids, so
+  it charges two taker fees. Posting limit sells at those prices instead makes you the
+  maker — no taker fee, plus a rebate share — but drops the execution guarantee: the order
+  may simply not fill while `bid+bid > 1` holds, and you are left holding a set. The
+  numbers reported here are the conservative taker case.
 - **Residual risks even in the "risk-free" trade.** Partial fills (one leg only), price
-  moving between fills, approvals/USDC bridging friction, market invalidation. None are
-  handled here because the project intentionally stops at detection.
+  moving between fills (the split direction runs mint → sell → sell non-atomically),
+  approvals/USDC bridging friction, market invalidation. None are handled here because the
+  project intentionally stops at detection.
 
 ## Build
 
@@ -198,7 +219,7 @@ the websocket immediately.
 | `/list` | Watched markets |
 | `/search <query>` | Find markets, returns tap-to-copy slugs |
 | `/settings` | Show alert filters |
-| `/set <key> <value>` | Tune alerts — keys: `enabled`, `only_profitable`, `min_edge`, `min_profit`, `crossings` |
+| `/set <key> <value>` | Tune alerts — keys: `enabled`, `only_profitable`, `min_edge`, `min_profit`, `crossings`, `mint`, `split` |
 | `/mute`, `/unmute` | Pause / resume alerts |
 | `/top` | Quick combined summary of current opportunities |
 | `/opportunities` | Each opportunity as its own message with a ✅ *seen* button |
@@ -214,17 +235,19 @@ category is limited to its **~2000 highest-volume** active markets (fetched
 `order=volumeNum desc`) — the ones actually worth arbing; raise `discover_min_volume` to
 focus further. If a category refresh errors partway, that pass keeps existing markets
 rather than dropping them. **Notification filters** (`/set`, `/mute`) are held per-bot,
-persisted to `settings_file`, and applied to every alert. Alerts de-duplicate per market:
-a market re-alerts only when its edge improves by at least `realert_improvement`.
+persisted to `settings_file`, and applied to every alert; `mint` and `split` toggle the two
+arb directions independently (both on by default). Alerts de-duplicate per market *and*
+direction: a market re-alerts on a given direction only when that direction's edge improves
+by at least `realert_improvement`.
 
 ## REST API
 
 | Method / Path | Description |
 |---|---|
-| `GET /health` | ws connection, watched count, last-update age |
+| `GET /health` | ws connection, watched count, per-direction opportunity counts, last-update age |
 | `GET /config` | Effective arbitrage parameters |
-| `GET /opportunities` | Current opportunities (sorted by net profit) |
-| `GET /crossings?after_seq=&limit=` | Closed micro-crossings with lifetime and peak edge |
+| `GET /opportunities` | Current opportunities, both directions (sorted by net profit) |
+| `GET /crossings?after_seq=&limit=` | Closed micro-crossings with lifetime, direction and peak edge |
 | `GET /categories` | List tracked categories |
 | `POST /category` | Track a category — body `{"input":"<link\|slug\|condition_id>"}` |
 | `DELETE /category/:slug` | Stop tracking a category |
@@ -234,9 +257,15 @@ a market re-alerts only when its edge improves by at least `realert_improvement`
 | `GET /search?q=&limit=` | Search markets |
 
 `GET /opportunities` filters: `profitable=true|false`, `min_edge=<f>`, `min_profit=<f>`,
-`limit=<n>`. Each opportunity carries market metadata plus an `arb` object
-(`best_yes`, `best_no`, `sum`, `gross_edge`, `size`, `cost`, `fees`, `gas`, `net_profit`,
-`roi`, `profitable`) and an optional `sell_side_edge`.
+`strategy=mint|split`, `limit=<n>`. Each opportunity carries market metadata plus an `arb`
+object (`strategy`, `best_yes`, `best_no`, `sum`, `gross_edge`, `size`, `cost`, `payout`,
+`fees`, `gas`, `net_profit`, `roi`, `avg_edge`, `profitable`).
+
+`strategy` is `mint` (best_yes/best_no are **asks**, `cost` is the ladder spend, `payout`
+is `size`) or `split` (best_yes/best_no are **bids**, `cost` is `size` — $1 per minted set
+— and `payout` is the ladder proceeds). `gross_edge` is `1 − sum` for mint and `sum − 1`
+for split, so the same `min_edge` threshold applies to both. The same market can appear
+once per direction.
 
 ## Docker & deploy
 

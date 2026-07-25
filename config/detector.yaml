@@ -25,10 +25,13 @@ discover_interval_secs: 300
 discover_min_volume: 0      # raise to skip tiny/illiquid markets in a category
 discover_max_markets: 100000
 
-# Arbitrage economics.
+# Arbitrage economics. Applied to both directions:
+#   mint  — ask(YES) + ask(NO) < 1: buy both legs, merge the set back into $1
+#   split — bid(YES) + bid(NO) > 1: split $1 into a set, sell both legs
 # Taker fee (bps per side) by category, from Polymarket Fee Structure V2
-# (fee_bps = 5000 × category_rate; both arb legs are takers so both pay). Markets
-# get their category's fee at discovery; anything uncategorised uses fee_bps below.
+# (fee_bps = 5000 × category_rate; both legs are takers in either direction, so
+# a set always pays two fees). Markets get their category's fee at discovery;
+# anything uncategorised uses fee_bps below.
 category_fee_bps:
   crypto: 350        # $1.75 / 100 shares at price 0.50
   sports: 250        # $1.25
@@ -41,8 +44,8 @@ category_fee_bps:
   geopolitics: 0     # world events are free
   world: 0
 fee_bps: 0          # fallback for manual/uncategorised markets
-slippage_bps: 0     # buffer added to each buy price
-gas_cost: 0.0       # fixed USDC cost to merge/redeem the set
+slippage_bps: 0     # buffer added to each buy price, subtracted from each sell price
+gas_cost: 0.0       # fixed USDC gas for the CTF leg (merge for mint, split for split)
 max_capital: 1000   # capital cap per trade, USDC
 min_profit: 0.0     # net USDC profit to flag as profitable
-min_edge: 0.0       # minimum (1 - sum) to report at all
+min_edge: 0.0       # minimum gross edge to report (1-sum for mint, sum-1 for split)

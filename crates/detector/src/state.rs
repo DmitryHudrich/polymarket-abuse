@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use arb_core::{evaluate, ArbResult, Level};
+use arb_core::{evaluate, evaluate_split, ArbResult, Level, Strategy};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -15,14 +15,16 @@ use crate::config::Config;
 /// How many closed micro-crossings to retain for `/crossings`.
 const CROSSING_LOG_CAP: usize = 500;
 
-/// A coherent buy-set arb (`ask_YES + ask_NO < 1`) currently open on a market —
-/// a "micro-crossing" of native liquidity through the mirror. Tracked so we can
-/// measure how long it stays visible.
+/// A coherent set arb currently open on a market — buy-set (`ask_YES + ask_NO
+/// < 1`) or sell-set (`bid_YES + bid_NO > 1`) — a "micro-crossing" of native
+/// liquidity through the mirror. Tracked so we can measure how long it stays
+/// visible.
 struct OpenCrossing {
     opened: Instant,
     opened_at: u64,
     question: String,
     market_url: String,
+    strategy: Strategy,
     peak_avg_edge: f64,
     peak_net: f64,
     peak_size: f64,
@@ -35,6 +37,7 @@ pub struct ClosedCrossing {
     pub condition_id: String,
     pub question: String,
     pub market_url: String,
+    pub strategy: Strategy,
     pub lived_ms: u64,
     pub peak_avg_edge: f64,
     pub peak_net: f64,
@@ -119,6 +122,10 @@ impl LiveBook {
         Self::levels(&self.asks)
     }
 
+    pub fn bids(&self) -> Vec<Level> {
+        Self::levels(&self.bids)
+    }
+
     pub fn best_bid(&self) -> Option<f64> {
         self.bids
             .keys()
@@ -139,6 +146,8 @@ impl LiveBook {
 struct BookSnap {
     yes_asks: Vec<Level>,
     no_asks: Vec<Level>,
+    yes_bids: Vec<Level>,
+    no_bids: Vec<Level>,
     yes_bid: Option<f64>,
     yes_ask: Option<f64>,
     no_bid: Option<f64>,
@@ -189,7 +198,10 @@ pub struct AppState {
     pub manual: Arc<RwLock<HashMap<String, Market>>>,
     pub token_index: Arc<RwLock<HashMap<String, String>>>,
     pub books: Arc<RwLock<HashMap<String, LiveBook>>>,
+    /// Live buy-set opportunities (`Strategy::Mint`), keyed by condition id.
     pub opps: Arc<RwLock<HashMap<String, Opportunity>>>,
+    /// Live split-and-sell opportunities (`Strategy::Split`), keyed by condition id.
+    pub split_opps: Arc<RwLock<HashMap<String, Opportunity>>>,
     crossings_open: Arc<RwLock<HashMap<String, OpenCrossing>>>,
     crossings_log: Arc<RwLock<VecDeque<ClosedCrossing>>>,
     crossing_seq: Arc<AtomicU64>,
@@ -209,6 +221,7 @@ impl AppState {
             token_index: Default::default(),
             books: Default::default(),
             opps: Default::default(),
+            split_opps: Default::default(),
             crossings_open: Default::default(),
             crossings_log: Default::default(),
             crossing_seq: Arc::new(AtomicU64::new(0)),
@@ -266,6 +279,7 @@ impl AppState {
         books.remove(&m.yes_token);
         books.remove(&m.no_token);
         self.opps.write().await.remove(&cond);
+        self.split_opps.write().await.remove(&cond);
         Some(m)
     }
 
@@ -352,8 +366,8 @@ impl AppState {
         self.manual.read().await.values().cloned().collect()
     }
 
-    /// Re-run the arbitrage math for one market from its current live books and
-    /// store or clear the resulting opportunity.
+    /// Re-run both arbitrage directions for one market from its current live
+    /// books and store or clear the resulting opportunities.
     pub async fn recompute(&self, condition_id: &str) {
         let market = {
             let watch = self.watch.read().await;
@@ -370,6 +384,8 @@ impl AppState {
             BookSnap {
                 yes_asks: yes.map(LiveBook::asks).unwrap_or_default(),
                 no_asks: no.map(LiveBook::asks).unwrap_or_default(),
+                yes_bids: yes.map(LiveBook::bids).unwrap_or_default(),
+                no_bids: no.map(LiveBook::bids).unwrap_or_default(),
                 yes_bid: yes.and_then(LiveBook::best_bid),
                 yes_ask: yes.and_then(LiveBook::best_ask),
                 no_bid: no.and_then(LiveBook::best_bid),
@@ -379,17 +395,36 @@ impl AppState {
 
         self.last_update.store(now(), Ordering::Relaxed);
 
-        let arb = if snap.is_coherent() {
+        let (mint, split) = if snap.is_coherent() {
             let params = arb_core::ArbParams {
                 fee_bps: market.fee_bps.unwrap_or(self.cfg.arb.fee_bps),
                 ..self.cfg.arb
             };
-            evaluate(&snap.yes_asks, &snap.no_asks, &params)
+            (
+                evaluate(&snap.yes_asks, &snap.no_asks, &params),
+                evaluate_split(&snap.yes_bids, &snap.no_bids, &params),
+            )
         } else {
-            None
+            (None, None)
         };
 
-        match &arb {
+        self.store_opp(&market, &self.opps, mint.as_ref()).await;
+        self.store_opp(&market, &self.split_opps, split.as_ref())
+            .await;
+        self.note_crossing(&market, Strategy::Mint, mint.as_ref())
+            .await;
+        self.note_crossing(&market, Strategy::Split, split.as_ref())
+            .await;
+    }
+
+    /// Insert or clear one market's entry in an opportunity map.
+    async fn store_opp(
+        &self,
+        market: &Market,
+        map: &RwLock<HashMap<String, Opportunity>>,
+        arb: Option<&ArbResult>,
+    ) {
+        match arb {
             Some(arb) => {
                 let opp = Opportunity {
                     question: market.question.clone(),
@@ -403,37 +438,32 @@ impl AppState {
                     arb: arb.clone(),
                     updated_at: now(),
                 };
-                self.opps
-                    .write()
-                    .await
-                    .insert(condition_id.to_string(), opp);
+                map.write().await.insert(market.condition_id.clone(), opp);
             }
             None => {
-                self.opps.write().await.remove(condition_id);
+                map.write().await.remove(&market.condition_id);
             }
         }
-
-        self.note_crossing(&market, arb.as_ref()).await;
     }
 
-    /// Track the lifetime of a coherent buy-set arb. Called on every recompute:
-    /// an active arb opens/updates a crossing; its absence closes it and records
-    /// how long it was visible.
-    async fn note_crossing(&self, market: &Market, arb: Option<&ArbResult>) {
+    /// Track the lifetime of one coherent set arb. Called on every recompute for
+    /// each strategy: an active arb opens/updates a crossing; its absence closes
+    /// it and records how long it was visible.
+    async fn note_crossing(&self, market: &Market, strategy: Strategy, arb: Option<&ArbResult>) {
+        let key = format!("{}:{}", market.condition_id, strategy.as_str());
         let mut open = self.crossings_open.write().await;
         match arb {
             Some(a) => {
-                let e = open
-                    .entry(market.condition_id.clone())
-                    .or_insert_with(|| OpenCrossing {
-                        opened: Instant::now(),
-                        opened_at: now(),
-                        question: market.question.clone(),
-                        market_url: market.market_url(),
-                        peak_avg_edge: f64::MIN,
-                        peak_net: f64::MIN,
-                        peak_size: 0.0,
-                    });
+                let e = open.entry(key).or_insert_with(|| OpenCrossing {
+                    opened: Instant::now(),
+                    opened_at: now(),
+                    question: market.question.clone(),
+                    market_url: market.market_url(),
+                    strategy,
+                    peak_avg_edge: f64::MIN,
+                    peak_net: f64::MIN,
+                    peak_size: 0.0,
+                });
                 if a.avg_edge > e.peak_avg_edge {
                     e.peak_avg_edge = a.avg_edge;
                     e.peak_size = a.size;
@@ -441,13 +471,14 @@ impl AppState {
                 e.peak_net = e.peak_net.max(a.net_profit);
             }
             None => {
-                if let Some(e) = open.remove(&market.condition_id) {
+                if let Some(e) = open.remove(&key) {
                     let seq = self.crossing_seq.fetch_add(1, Ordering::Relaxed) + 1;
                     let closed = ClosedCrossing {
                         seq,
                         condition_id: market.condition_id.clone(),
                         question: e.question,
                         market_url: e.market_url,
+                        strategy: e.strategy,
                         lived_ms: e.opened.elapsed().as_millis() as u64,
                         peak_avg_edge: e.peak_avg_edge,
                         peak_net: e.peak_net,
@@ -463,6 +494,13 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Every live opportunity across both strategies.
+    pub async fn all_opportunities(&self) -> Vec<Opportunity> {
+        let mint = self.opps.read().await;
+        let split = self.split_opps.read().await;
+        mint.values().chain(split.values()).cloned().collect()
     }
 
     /// Closed crossings with `seq > after_seq`, oldest first, plus the newest seq
