@@ -40,6 +40,7 @@ services:
     environment:
       TELEGRAM_BACKEND_URL: http://detector:8080
       TELEGRAM_SETTINGS_FILE: /app/data/bot-settings.json
+      TELEGRAM_ARCHIVE_FILE: /app/data/bot-archive.json
     volumes:
       - bot-data:/app/data
     depends_on:

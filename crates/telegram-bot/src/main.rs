@@ -7,14 +7,33 @@ mod config;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
+
+/// Cap on retained pending (unacknowledged) and archived items.
+const ARCHIVE_CAP: usize = 1000;
+
+/// A signal the user has acknowledged with the "seen" button, kept for `/archive`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchivedItem {
+    kind: String,
+    text: String,
+    created_at: u64,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Runtime-tunable alert filters, changed from chat via `/set` and persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +118,11 @@ struct Bot {
     api_base: String,
     settings: RwLock<Settings>,
     settings_path: PathBuf,
+    archive_path: PathBuf,
+    /// Items shown with a "seen" button, keyed by the id in their callback_data.
+    pending: RwLock<HashMap<u64, ArchivedItem>>,
+    archive: RwLock<Vec<ArchivedItem>>,
+    item_seq: AtomicU64,
 }
 
 #[tokio::main]
@@ -123,12 +147,18 @@ async fn main() -> Result<()> {
     let api_base = format!("https://api.telegram.org/bot{}", cfg.bot_token);
     let settings_path = cfg.settings_file.clone();
     let settings = load_settings(&settings_path, &cfg);
+    let archive_path = cfg.archive_file.clone();
+    let archive = load_archive(&archive_path);
     let bot = Arc::new(Bot {
         http,
         updates_http,
         api_base,
         settings: RwLock::new(settings),
         settings_path,
+        archive_path,
+        pending: RwLock::new(HashMap::new()),
+        archive: RwLock::new(archive),
+        item_seq: AtomicU64::new(0),
         cfg,
     });
 
@@ -238,11 +268,14 @@ async fn command_loop(bot: Arc<Bot>) {
         };
         for u in updates {
             offset = u.update_id + 1;
+            if let Some(cq) = u.callback_query {
+                bot.handle_callback(cq).await;
+                continue;
+            }
             let Some(msg) = u.message else { continue };
             let Some(text) = msg.text else { continue };
             let chat_id = msg.chat.id.to_string();
-            let reply = bot.handle_command(text.trim()).await;
-            if let Some(reply) = reply {
+            if let Some(reply) = bot.handle_command(&chat_id, text.trim()).await {
                 if let Err(e) = bot.send(&chat_id, &reply).await {
                     tracing::warn!("command reply failed: {e}");
                 }
@@ -287,22 +320,194 @@ impl Bot {
         Ok(r)
     }
 
-    async fn cmd_crossings(&self) -> String {
-        match self.fetch_crossings(0, 500).await {
-            Ok(r) if !r.crossings.is_empty() => {
-                let mut s = String::from("<b>Recent micro-crossings</b>\n\n");
-                for c in r.crossings.iter().rev().take(10) {
-                    s.push_str(&format_crossing(c));
-                    s.push_str("\n\n");
-                }
-                s
+    /// Send the current opportunities, one message per item with a "seen" button.
+    async fn cmd_opportunities(&self, chat_id: &str) {
+        let items: Vec<(String, String)> = match self.fetch_opportunities().await {
+            Ok(r) => r
+                .opportunities
+                .iter()
+                .take(15)
+                .map(|o| (format_alert(o), "opportunity".to_string()))
+                .collect(),
+            Err(e) => {
+                let _ = self
+                    .send(
+                        chat_id,
+                        &format!("backend unreachable: {}", esc(&e.to_string())),
+                    )
+                    .await;
+                return;
             }
-            Ok(_) => "No micro-crossings recorded yet.".to_string(),
-            Err(e) => format!("backend unreachable: {}", esc(&e.to_string())),
+        };
+        self.send_items(chat_id, items, "No live opportunities right now.")
+            .await;
+    }
+
+    /// Send recent micro-crossings, one message per item with a "seen" button.
+    async fn cmd_crossings(&self, chat_id: &str) {
+        let items: Vec<(String, String)> = match self.fetch_crossings(0, 500).await {
+            Ok(r) => r
+                .crossings
+                .iter()
+                .rev()
+                .take(15)
+                .map(|c| (format_crossing(c), "crossing".to_string()))
+                .collect(),
+            Err(e) => {
+                let _ = self
+                    .send(
+                        chat_id,
+                        &format!("backend unreachable: {}", esc(&e.to_string())),
+                    )
+                    .await;
+                return;
+            }
+        };
+        self.send_items(chat_id, items, "No micro-crossings recorded yet.")
+            .await;
+    }
+
+    /// Send each `(text, kind)` as its own message carrying a "seen" button that
+    /// moves it to the archive when pressed.
+    async fn send_items(&self, chat_id: &str, items: Vec<(String, String)>, empty: &str) {
+        if items.is_empty() {
+            let _ = self.send(chat_id, empty).await;
+            return;
+        }
+        for (text, kind) in items {
+            let id = self.item_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            {
+                let mut pending = self.pending.write().await;
+                pending.insert(
+                    id,
+                    ArchivedItem {
+                        kind,
+                        text: text.clone(),
+                        created_at: now(),
+                    },
+                );
+                if pending.len() > ARCHIVE_CAP {
+                    if let Some(&oldest) = pending.keys().min() {
+                        pending.remove(&oldest);
+                    }
+                }
+            }
+            if let Err(e) = self
+                .send_with_button(chat_id, &text, "✅ Увидел", &format!("seen:{id}"))
+                .await
+            {
+                tracing::warn!("send item failed: {e}");
+            }
         }
     }
 
-    async fn handle_command(&self, text: &str) -> Option<String> {
+    async fn cmd_archive(&self) -> String {
+        let archive = self.archive.read().await;
+        if archive.is_empty() {
+            return "Archive is empty. Tap ✅ on a /crossings or /opportunities item to file it."
+                .into();
+        }
+        let mut s = format!("<b>Archive ({} items, newest first)</b>\n\n", archive.len());
+        for item in archive.iter().rev().take(10) {
+            s.push_str(&item.text);
+            s.push_str("\n\n");
+        }
+        s
+    }
+
+    /// Handle a "seen" button press: file the item and update its message.
+    async fn handle_callback(&self, cq: CallbackQuery) {
+        let id = cq
+            .data
+            .as_deref()
+            .and_then(|d| d.strip_prefix("seen:"))
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let item = match id {
+            Some(id) => self.pending.write().await.remove(&id),
+            None => None,
+        };
+
+        match item {
+            Some(item) => {
+                {
+                    let mut archive = self.archive.write().await;
+                    archive.push(item.clone());
+                    while archive.len() > ARCHIVE_CAP {
+                        archive.remove(0);
+                    }
+                }
+                self.save_archive().await;
+                let _ = self.answer_callback(&cq.id, "В архиве").await;
+                if let Some(msg) = cq.message {
+                    let text = format!("{}\n\n🗂 <i>в архиве</i>", item.text);
+                    let _ = self.edit_message(msg.chat.id, msg.message_id, &text).await;
+                }
+            }
+            None => {
+                let _ = self
+                    .answer_callback(&cq.id, "Устарело (перезапуск бота)")
+                    .await;
+            }
+        }
+    }
+
+    async fn save_archive(&self) {
+        let snapshot = self.archive.read().await.clone();
+        if let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) {
+            if let Err(e) = tokio::fs::write(&self.archive_path, bytes).await {
+                tracing::warn!("cannot save archive: {e}");
+            }
+        }
+    }
+
+    async fn send_with_button(
+        &self,
+        chat_id: &str,
+        text: &str,
+        label: &str,
+        callback_data: &str,
+    ) -> Result<()> {
+        let url = format!("{}/sendMessage", self.api_base);
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": { "inline_keyboard": [[{ "text": label, "callback_data": callback_data }]] },
+        });
+        self.http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("sendMessage failed")?
+            .error_for_status()
+            .context("sendMessage error status")?;
+        Ok(())
+    }
+
+    async fn answer_callback(&self, callback_id: &str, text: &str) -> Result<()> {
+        let url = format!("{}/answerCallbackQuery", self.api_base);
+        let body = serde_json::json!({ "callback_query_id": callback_id, "text": text });
+        self.http.post(&url).json(&body).send().await?;
+        Ok(())
+    }
+
+    async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+        let url = format!("{}/editMessageText", self.api_base);
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        self.http.post(&url).json(&body).send().await?;
+        Ok(())
+    }
+
+    async fn handle_command(&self, chat_id: &str, text: &str) -> Option<String> {
         let mut parts = text.splitn(2, char::is_whitespace);
         let raw = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
@@ -311,6 +516,15 @@ impl Bot {
             "/start" | "/help" => Some(format!("{HELP}{}", version_line())),
             "/status" => Some(self.status_text().await),
             "/top" => Some(self.top_text().await),
+            "/opportunities" | "/opps" => {
+                self.cmd_opportunities(chat_id).await;
+                None
+            }
+            "/crossings" => {
+                self.cmd_crossings(chat_id).await;
+                None
+            }
+            "/archive" => Some(self.cmd_archive().await),
             "/add" => Some(self.cmd_add(arg).await),
             "/remove" | "/rm" => Some(self.cmd_remove(arg).await),
             "/list" => Some(self.cmd_list().await),
@@ -318,7 +532,6 @@ impl Bot {
             "/add_category" | "/addcategory" => Some(self.cmd_add_category(arg).await),
             "/remove_category" | "/removecategory" => Some(self.cmd_remove_category(arg).await),
             "/categories" => Some(self.cmd_categories().await),
-            "/crossings" => Some(self.cmd_crossings().await),
             "/settings" => Some(self.cmd_settings().await),
             "/set" => Some(self.cmd_set(arg).await),
             "/mute" => Some(self.cmd_toggle(false).await),
@@ -640,8 +853,11 @@ impl Bot {
 
     async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
         let url = format!("{}/getUpdates", self.api_base);
-        let body =
-            serde_json::json!({ "offset": offset, "timeout": 25, "allowed_updates": ["message"] });
+        let body = serde_json::json!({
+            "offset": offset,
+            "timeout": 25,
+            "allowed_updates": ["message", "callback_query"],
+        });
         let resp: TgResponse<Vec<Update>> = self
             .updates_http
             .post(&url)
@@ -768,6 +984,13 @@ fn load_settings(path: &std::path::Path, cfg: &Config) -> Settings {
     }
 }
 
+fn load_archive(path: &std::path::Path) -> Vec<ArchivedItem> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 const HELP: &str = "<b>Polymarket YES/NO arbitrage alerter</b>\n\n\
 Alerts fire only when a full set (YES+NO) can be bought below $1. \
 This bot never places orders.\n\n\
@@ -783,8 +1006,10 @@ Paste a Polymarket link, or:\n\
 /set &lt;key&gt; &lt;value&gt; — keys: enabled, only_profitable, min_edge, min_profit, crossings\n\
 /mute · /unmute\n\n\
 <b>Info</b>\n\
-/top — current best opportunities\n\
-/crossings — recent micro-crossings and how long they lived\n\
+/top — quick summary of current opportunities\n\
+/opportunities — each opportunity as its own message with a ✅ Увидел button\n\
+/crossings — recent micro-crossings, each with a ✅ Увидел button\n\
+/archive — items you marked as seen\n\
 /status — backend health";
 
 #[derive(Debug, Deserialize)]
@@ -797,15 +1022,27 @@ struct TgResponse<T> {
 struct Update {
     update_id: i64,
     message: Option<Message>,
+    callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Message {
     chat: Chat,
+    #[serde(default)]
+    message_id: i64,
     text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Chat {
     id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CallbackQuery {
+    id: String,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    message: Option<Message>,
 }

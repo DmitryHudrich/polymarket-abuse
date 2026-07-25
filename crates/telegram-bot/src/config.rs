@@ -25,6 +25,7 @@ pub struct Config {
     pub only_profitable: bool,
     pub realert_improvement: f64,
     pub settings_file: PathBuf,
+    pub archive_file: PathBuf,
     pub log_level: String,
 }
 
@@ -41,6 +42,7 @@ impl Default for Config {
             only_profitable: true,
             realert_improvement: 0.01,
             settings_file: "bot-settings.json".into(),
+            archive_file: "bot-archive.json".into(),
             log_level: "info".into(),
         }
     }
@@ -59,6 +61,7 @@ pub struct PartialConfig {
     pub only_profitable: Option<bool>,
     pub realert_improvement: Option<f64>,
     pub settings_file: Option<PathBuf>,
+    pub archive_file: Option<PathBuf>,
     pub log_level: Option<String>,
 }
 
@@ -80,6 +83,7 @@ impl PartialConfig {
             only_profitable,
             realert_improvement,
             settings_file,
+            archive_file,
             log_level
         );
         self
@@ -97,6 +101,7 @@ impl PartialConfig {
             only_profitable: env_parse("TELEGRAM_ONLY_PROFITABLE"),
             realert_improvement: env_parse("TELEGRAM_REALERT_IMPROVEMENT"),
             settings_file: env_str("TELEGRAM_SETTINGS_FILE").map(PathBuf::from),
+            archive_file: env_str("TELEGRAM_ARCHIVE_FILE").map(PathBuf::from),
             log_level: env_str("TELEGRAM_LOG_LEVEL"),
         }
     }
@@ -114,6 +119,7 @@ impl PartialConfig {
             only_profitable: self.only_profitable.unwrap_or(d.only_profitable),
             realert_improvement: self.realert_improvement.unwrap_or(d.realert_improvement),
             settings_file: self.settings_file.unwrap_or(d.settings_file),
+            archive_file: self.archive_file.unwrap_or(d.archive_file),
             log_level: self.log_level.unwrap_or(d.log_level),
         }
     }
@@ -151,6 +157,8 @@ pub struct Cli {
     #[arg(long)]
     pub settings_file: Option<PathBuf>,
     #[arg(long)]
+    pub archive_file: Option<PathBuf>,
+    #[arg(long)]
     pub log_level: Option<String>,
 }
 
@@ -167,6 +175,7 @@ impl Cli {
             only_profitable: self.only_profitable,
             realert_improvement: self.realert_improvement,
             settings_file: self.settings_file,
+            archive_file: self.archive_file,
             log_level: self.log_level,
         };
         (self.config, p)

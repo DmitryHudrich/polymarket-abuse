@@ -196,8 +196,10 @@ the websocket immediately.
 | `/settings` | Show alert filters |
 | `/set <key> <value>` | Tune alerts — keys: `enabled`, `only_profitable`, `min_edge`, `min_profit`, `crossings` |
 | `/mute`, `/unmute` | Pause / resume alerts |
-| `/top` | Current best opportunities |
-| `/crossings` | Recent micro-crossings and how long each was visible |
+| `/top` | Quick combined summary of current opportunities |
+| `/opportunities` | Each opportunity as its own message with a ✅ *seen* button |
+| `/crossings` | Recent micro-crossings, each with a ✅ *seen* button |
+| `/archive` | Items you marked as seen (bounded, persisted) |
 | `/status` | Backend health (ws connected, watched/category counts) |
 | `/help`, `/start` | Usage (shows the build's commit hash as `first…last`) |
 
