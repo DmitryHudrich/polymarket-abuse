@@ -288,6 +288,7 @@ impl GammaMarket {
             no_token: ids[no_idx].clone(),
             volume: self.volume_num.unwrap_or(0.0),
             end_date: self.end_date,
+            fee_bps: None,
         })
     }
 }

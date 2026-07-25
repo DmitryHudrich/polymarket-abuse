@@ -63,8 +63,11 @@ Each opportunity is reported with the full economics so you can judge it before 
 - **Order-book depth** — the engine sweeps both ask ladders together and stacks sets only
   while the *marginal* set stays below 1, so `size`/`cost`/`net_profit` reflect real
   executable depth, not just top-of-book.
-- **Fees** — `fee_bps`, applied per side as `rate · min(price, 1−price) · shares`
-  (Polymarket's CLOB fee is currently 0).
+- **Fees** — Polymarket's Fee Structure V2 taker fee, applied per side as
+  `fee_bps/10000 · min(price, 1−price) · shares`. Both arb legs take liquidity, so both
+  pay. Per-category rates (`category_fee_bps`, e.g. crypto `350` = $1.75/100 shares at
+  price 0.50, sports `250`, geopolitics `0`) are assigned to each market at discovery;
+  manual/uncategorised markets fall back to the global `fee_bps`.
 - **Slippage** — `slippage_bps` pads each buy price.
 - **Gas** — `gas_cost`, the fixed USDC cost of the closing `merge`/`redeem`, subtracted
   from net profit; it is what kills thin edges on small size.
@@ -188,6 +191,7 @@ the websocket immediately.
 | `/add_category <link \| slug>` | Track a whole category (e.g. `polymarket.com/iran`) — every market in it is pulled in and kept in sync |
 | `/remove_category <slug>` | Stop tracking a category |
 | `/categories` | List tracked categories |
+| `/fees` | Configured taker fees per category |
 | *(paste a Polymarket link)* | Watch a single market |
 | `/add <link \| slug>` | Watch a single market |
 | `/remove <slug \| condition_id>` | Unpin a single market |

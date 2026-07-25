@@ -328,6 +328,12 @@ async fn run_discovery_once(state: &AppState, gamma: &Gamma) {
 
     let mut all_ok = true;
     for c in &categories {
+        let fee = state
+            .cfg
+            .category_fee_bps
+            .get(&c.slug)
+            .copied()
+            .unwrap_or(state.cfg.arb.fee_bps);
         match gamma
             .markets_by_tag(
                 &c.tag_id,
@@ -337,7 +343,10 @@ async fn run_discovery_once(state: &AppState, gamma: &Gamma) {
             .await
         {
             Ok(markets) => {
-                for m in markets {
+                for mut m in markets {
+                    // A market in several watched categories keeps the highest fee.
+                    let prev = desired.get(&m.condition_id).and_then(|e| e.fee_bps);
+                    m.fee_bps = Some(prev.map_or(fee, |p| p.max(fee)));
                     desired.insert(m.condition_id.clone(), m);
                 }
             }
@@ -364,5 +373,6 @@ async fn get_config(State(app): State<App>) -> Json<serde_json::Value> {
         "ws_url": app.state.cfg.ws_url,
         "search_limit": app.state.cfg.search_limit,
         "arb": app.state.cfg.arb,
+        "category_fee_bps": app.state.cfg.category_fee_bps,
     }))
 }

@@ -26,7 +26,21 @@ discover_min_volume: 0      # raise to skip tiny/illiquid markets in a category
 discover_max_markets: 100000
 
 # Arbitrage economics.
-fee_bps: 0          # Polymarket CLOB fee per side, currently 0
+# Taker fee (bps per side) by category, from Polymarket Fee Structure V2
+# (fee_bps = 5000 × category_rate; both arb legs are takers so both pay). Markets
+# get their category's fee at discovery; anything uncategorised uses fee_bps below.
+category_fee_bps:
+  crypto: 350        # $1.75 / 100 shares at price 0.50
+  sports: 250        # $1.25
+  politics: 200      # $1.00
+  finance: 200
+  tech: 200
+  economy: 250
+  culture: 250
+  weather: 250
+  geopolitics: 0     # world events are free
+  world: 0
+fee_bps: 0          # fallback for manual/uncategorised markets
 slippage_bps: 0     # buffer added to each buy price
 gas_cost: 0.0       # fixed USDC cost to merge/redeem the set
 max_capital: 1000   # capital cap per trade, USDC

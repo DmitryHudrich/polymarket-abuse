@@ -393,7 +393,7 @@ impl Bot {
                 }
             }
             if let Err(e) = self
-                .send_with_button(chat_id, &text, "✅ Увидел", &format!("seen:{id}"))
+                .send_with_button(chat_id, &text, "✅ Seen", &format!("seen:{id}"))
                 .await
             {
                 tracing::warn!("send item failed: {e}");
@@ -438,15 +438,15 @@ impl Bot {
                     }
                 }
                 self.save_archive().await;
-                let _ = self.answer_callback(&cq.id, "В архиве").await;
+                let _ = self.answer_callback(&cq.id, "Archived").await;
                 if let Some(msg) = cq.message {
-                    let text = format!("{}\n\n🗂 <i>в архиве</i>", item.text);
+                    let text = format!("{}\n\n🗂 <i>archived</i>", item.text);
                     let _ = self.edit_message(msg.chat.id, msg.message_id, &text).await;
                 }
             }
             None => {
                 let _ = self
-                    .answer_callback(&cq.id, "Устарело (перезапуск бота)")
+                    .answer_callback(&cq.id, "Expired (bot restarted)")
                     .await;
             }
         }
@@ -532,6 +532,7 @@ impl Bot {
             "/add_category" | "/addcategory" => Some(self.cmd_add_category(arg).await),
             "/remove_category" | "/removecategory" => Some(self.cmd_remove_category(arg).await),
             "/categories" => Some(self.cmd_categories().await),
+            "/fees" => Some(self.cmd_fees().await),
             "/settings" => Some(self.cmd_settings().await),
             "/set" => Some(self.cmd_set(arg).await),
             "/mute" => Some(self.cmd_toggle(false).await),
@@ -610,6 +611,36 @@ impl Bot {
             }
             Err(e) => format!("backend unreachable: {}", esc(&e.to_string())),
         }
+    }
+
+    async fn cmd_fees(&self) -> String {
+        let url = format!("{}/config", self.cfg.backend_url);
+        let v: serde_json::Value = match self.http.get(&url).send().await {
+            Ok(r) => r.json().await.unwrap_or_default(),
+            Err(e) => return format!("backend unreachable: {}", esc(&e.to_string())),
+        };
+        let mut s = String::from("<b>Configured taker fees</b> (bps per side)\n\n");
+        if let Some(map) = v["category_fee_bps"].as_object() {
+            let mut rows: Vec<(String, f64)> = map
+                .iter()
+                .filter_map(|(k, val)| val.as_f64().map(|f| (k.clone(), f)))
+                .collect();
+            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for (cat, bps) in rows {
+                s.push_str(&format!(
+                    "• {}: <b>{:.0}</b>  (≈ ${:.2}/100 @ 0.50)\n",
+                    esc(&cat),
+                    bps,
+                    bps * 0.005,
+                ));
+            }
+        }
+        let global = v["arb"]["fee_bps"].as_f64().unwrap_or(0.0);
+        s.push_str(&format!(
+            "\nfallback (uncategorised): <b>{global:.0}</b>\n\
+             <i>Both arb legs are takers, so a set pays both.</i>"
+        ));
+        s
     }
 
     async fn cmd_settings(&self) -> String {
@@ -997,7 +1028,8 @@ This bot never places orders.\n\n\
 <b>Categories</b> (auto-tracked, refreshed every few minutes)\n\
 /add_category &lt;link|slug&gt; — track a whole category (e.g. polymarket.com/iran)\n\
 /remove_category &lt;slug&gt; — stop tracking it\n\
-/categories — list tracked categories\n\n\
+/categories — list tracked categories\n\
+/fees — configured taker fees per category\n\n\
 <b>Single markets</b>\n\
 Paste a Polymarket link, or:\n\
 /add &lt;link|slug&gt; · /remove &lt;slug&gt; · /list · /search &lt;query&gt;\n\n\
@@ -1007,8 +1039,8 @@ Paste a Polymarket link, or:\n\
 /mute · /unmute\n\n\
 <b>Info</b>\n\
 /top — quick summary of current opportunities\n\
-/opportunities — each opportunity as its own message with a ✅ Увидел button\n\
-/crossings — recent micro-crossings, each with a ✅ Увидел button\n\
+/opportunities — each opportunity as its own message with a ✅ Seen button\n\
+/crossings — recent micro-crossings, each with a ✅ Seen button\n\
 /archive — items you marked as seen\n\
 /status — backend health";
 

@@ -3,6 +3,7 @@
 
 use clap::Parser;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use arb_core::ArbParams;
@@ -13,6 +14,27 @@ fn env_str(key: &str) -> Option<String> {
 
 fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+/// Default taker fee (bps per side) by category slug, derived from Polymarket's
+/// Fee Structure V2 (`fee_bps = 5000 × category_rate`, matching the max fee at
+/// price 0.50). Geopolitics/world events are free.
+fn default_category_fees() -> HashMap<String, f64> {
+    [
+        ("crypto", 350.0),
+        ("sports", 250.0),
+        ("politics", 200.0),
+        ("tech", 200.0),
+        ("finance", 200.0),
+        ("economy", 250.0),
+        ("culture", 250.0),
+        ("weather", 250.0),
+        ("geopolitics", 0.0),
+        ("world", 0.0),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
 }
 
 /// Fully resolved configuration.
@@ -29,6 +51,7 @@ pub struct Config {
     pub discover_interval_secs: u64,
     pub discover_min_volume: f64,
     pub discover_max_markets: usize,
+    pub category_fee_bps: HashMap<String, f64>,
     pub arb: ArbParams,
 }
 
@@ -46,6 +69,7 @@ impl Default for Config {
             discover_interval_secs: 300,
             discover_min_volume: 0.0,
             discover_max_markets: 100_000,
+            category_fee_bps: default_category_fees(),
             arb: ArbParams::default(),
         }
     }
@@ -67,6 +91,7 @@ pub struct PartialConfig {
     pub discover_interval_secs: Option<u64>,
     pub discover_min_volume: Option<f64>,
     pub discover_max_markets: Option<usize>,
+    pub category_fee_bps: Option<HashMap<String, f64>>,
 
     pub fee_bps: Option<f64>,
     pub slippage_bps: Option<f64>,
@@ -95,6 +120,7 @@ impl PartialConfig {
             discover_interval_secs,
             discover_min_volume,
             discover_max_markets,
+            category_fee_bps,
             fee_bps,
             slippage_bps,
             gas_cost,
@@ -118,6 +144,7 @@ impl PartialConfig {
             discover_interval_secs: env_parse("DETECTOR_DISCOVER_INTERVAL_SECS"),
             discover_min_volume: env_parse("DETECTOR_DISCOVER_MIN_VOLUME"),
             discover_max_markets: env_parse("DETECTOR_DISCOVER_MAX_MARKETS"),
+            category_fee_bps: None,
             fee_bps: env_parse("DETECTOR_FEE_BPS"),
             slippage_bps: env_parse("DETECTOR_SLIPPAGE_BPS"),
             gas_cost: env_parse("DETECTOR_GAS_COST"),
@@ -143,6 +170,7 @@ impl PartialConfig {
                 .unwrap_or(d.discover_interval_secs),
             discover_min_volume: self.discover_min_volume.unwrap_or(d.discover_min_volume),
             discover_max_markets: self.discover_max_markets.unwrap_or(d.discover_max_markets),
+            category_fee_bps: self.category_fee_bps.unwrap_or(d.category_fee_bps),
             arb: ArbParams {
                 fee_bps: self.fee_bps.unwrap_or(d.arb.fee_bps),
                 slippage_bps: self.slippage_bps.unwrap_or(d.arb.slippage_bps),
@@ -221,6 +249,7 @@ impl Cli {
             discover_interval_secs: self.discover_interval_secs,
             discover_min_volume: self.discover_min_volume,
             discover_max_markets: self.discover_max_markets,
+            category_fee_bps: None,
             fee_bps: self.fee_bps,
             slippage_bps: self.slippage_bps,
             gas_cost: self.gas_cost,

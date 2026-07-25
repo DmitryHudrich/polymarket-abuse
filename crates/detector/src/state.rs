@@ -53,6 +53,10 @@ pub struct Market {
     pub volume: f64,
     #[serde(default)]
     pub end_date: Option<String>,
+    /// Taker fee (bps per side) for this market's category, assigned at discovery.
+    /// `None` falls back to the global `fee_bps`.
+    #[serde(default)]
+    pub fee_bps: Option<f64>,
 }
 
 impl Market {
@@ -376,7 +380,11 @@ impl AppState {
         self.last_update.store(now(), Ordering::Relaxed);
 
         let arb = if snap.is_coherent() {
-            evaluate(&snap.yes_asks, &snap.no_asks, &self.cfg.arb)
+            let params = arb_core::ArbParams {
+                fee_bps: market.fee_bps.unwrap_or(self.cfg.arb.fee_bps),
+                ..self.cfg.arb
+            };
+            evaluate(&snap.yes_asks, &snap.no_asks, &params)
         } else {
             None
         };
