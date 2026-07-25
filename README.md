@@ -225,7 +225,7 @@ the websocket immediately.
 | `/mute`, `/unmute` | Pause / resume alerts |
 | `/top` | Quick combined summary of current opportunities |
 | `/opportunities` | Each opportunity as its own message with a ✅ *seen* button |
-| `/crossings` | The recent micro-crossings as **one digest** with a single ✅ *seen all* button |
+| `/crossings` | Micro-crossings you have not filed yet, as **one digest** with a single ✅ *seen all* button |
 | `/archive` | Items you marked as seen, with the time they were filed (bounded, persisted) |
 | `/status` | Backend health (ws connected, watched/category counts) |
 | `/help`, `/start` | Usage (shows the build's commit hash as `first…last`) |
@@ -256,6 +256,14 @@ they lived. Times are rendered at `tz_offset_hours` and always carry their zone
 only interesting in aggregate. Each digest (from `/crossings` or from a live poll) gets a
 single **✅ Seen all** button that files every crossing in it to the archive at once; a
 digest too long for one Telegram message is split, with the button on the last part.
+
+Filing is also what makes a crossing *go away*: pressing ✅ advances an acknowledgement
+cursor (the highest backend `seq` in the batch, persisted in `settings_file`), and
+`/crossings` lists only what came after it. Without that cursor the command re-lists the
+backend's whole retained log every time, so the same crossings keep reappearing after you
+have marked them seen. The cursor covers every crossing the bot fetched for that batch —
+including ones the digest truncated or the filters hid — so acknowledging never leaves
+older entries stranded behind it.
 
 ## REST API
 

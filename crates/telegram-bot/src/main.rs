@@ -51,6 +51,9 @@ impl ArchivedItem {
 struct PendingBatch {
     items: Vec<ArchivedItem>,
     message_html: String,
+    /// Highest crossing `seq` in this batch, if it holds crossings. Filing the
+    /// batch advances the acknowledgement cursor to it.
+    ack_crossing_seq: Option<u64>,
 }
 
 fn now() -> u64 {
@@ -81,6 +84,12 @@ struct Settings {
     /// bids summing above $1.
     #[serde(default = "default_true")]
     split: bool,
+    /// Highest crossing `seq` filed with a ✅ button. `/crossings` lists only
+    /// what came after it, so acknowledged crossings stop coming back. Persisted
+    /// state rather than a user-tunable filter: not shown by `/settings` and not
+    /// accepted by `/set`.
+    #[serde(default)]
+    acked_crossing_seq: u64,
 }
 
 impl Settings {
@@ -93,6 +102,7 @@ impl Settings {
             crossings: false,
             mint: true,
             split: true,
+            acked_crossing_seq: 0,
         }
     }
 
@@ -107,6 +117,9 @@ impl Settings {
 
 #[derive(Debug, Deserialize, Clone)]
 struct Crossing {
+    /// Monotonic id from the backend, used as the acknowledgement cursor.
+    #[serde(default)]
+    seq: u64,
     question: String,
     market_url: String,
     #[serde(default = "mint_strategy")]
@@ -317,17 +330,25 @@ async fn crossings_loop(bot: Arc<Bot>) {
         }
         // Crossings close in bursts, so everything this poll picked up goes out
         // as one digest behind a single ✅ button instead of a message each.
-        let items: Vec<ArchivedItem> = resp
+        let shown: Vec<&Crossing> = resp
             .crossings
             .iter()
             .rev()
             .filter(|c| s.allows(&c.strategy) && c.peak_avg_edge >= s.min_edge)
+            .collect();
+        if shown.is_empty() {
+            continue;
+        }
+        let header = format!("⚡ <b>Micro-crossings</b> ({}, newest first)", shown.len());
+        // The cursor is a watermark, so filing this batch also covers the
+        // crossings the filters hid inside it.
+        let ack_seq = resp.crossings.iter().map(|c| c.seq).max();
+        let items: Vec<ArchivedItem> = shown
+            .iter()
             .map(|c| ArchivedItem::new("crossing", format_crossing(c, bot.cfg.tz_offset_minutes)))
             .collect();
-        if !items.is_empty() {
-            bot.send_digest(&bot.cfg.chat_id, "⚡ <b>Micro-crossings</b>", items, "")
-                .await;
-        }
+        bot.send_digest(&bot.cfg.chat_id, &header, items, ack_seq, "")
+            .await;
     }
 }
 
@@ -417,21 +438,40 @@ impl Bot {
     /// interesting in aggregate, so one message per crossing just floods the chat.
     async fn cmd_crossings(&self, chat_id: &str) {
         let tz = self.cfg.tz_offset_minutes;
-        let items: Vec<ArchivedItem> = match self.fetch_crossings(0, 500).await {
-            Ok(r) => r
-                .crossings
-                .iter()
-                .rev()
-                .take(CROSSINGS_SHOWN)
-                .map(|c| ArchivedItem::new("crossing", format_crossing(c, tz)))
-                .collect(),
+        // Only what has not been filed yet — otherwise every ✅ press is undone
+        // by the next /crossings, which re-lists the backend's whole log.
+        let acked = self.settings.read().await.acked_crossing_seq;
+        let crossings = match self.fetch_crossings(acked, 500).await {
+            Ok(r) => r.crossings,
             Err(e) => return self.send_backend_error(chat_id, &e).await,
         };
+        let shown: Vec<&Crossing> = crossings.iter().rev().take(CROSSINGS_SHOWN).collect();
+        let items: Vec<ArchivedItem> = shown
+            .iter()
+            .map(|c| ArchivedItem::new("crossing", format_crossing(c, tz)))
+            .collect();
+
+        // The cursor covers everything fetched, not just the newest page shown,
+        // so acknowledging can never leave older crossings stuck behind it.
+        let ack_seq = crossings.iter().map(|c| c.seq).max();
+        let hidden = crossings.len().saturating_sub(shown.len());
+        let header = if hidden > 0 {
+            format!(
+                "⚡ <b>Micro-crossings</b> (newest {} of {} unfiled)\n\
+                 <i>✅ also clears the {hidden} older ones</i>",
+                shown.len(),
+                crossings.len(),
+            )
+        } else {
+            format!("⚡ <b>Micro-crossings</b> ({}, newest first)", shown.len())
+        };
+
         self.send_digest(
             chat_id,
-            "⚡ <b>Micro-crossings</b>",
+            &header,
             items,
-            "No micro-crossings recorded yet.",
+            ack_seq,
+            "No new micro-crossings — the ones you filed are in /archive.",
         )
         .await;
     }
@@ -454,7 +494,7 @@ impl Bot {
         }
         for item in items {
             let text = item.text.clone();
-            let id = self.remember_pending(vec![item], text.clone()).await;
+            let id = self.remember_pending(vec![item], text.clone(), None).await;
             if let Err(e) = self
                 .send_with_button(chat_id, &text, "✅ Seen", &format!("seen:{id}"))
                 .await
@@ -471,10 +511,13 @@ impl Bot {
         chat_id: &str,
         header: &str,
         items: Vec<ArchivedItem>,
+        ack_crossing_seq: Option<u64>,
         empty: &str,
     ) {
         if items.is_empty() {
-            let _ = self.send(chat_id, empty).await;
+            if !empty.is_empty() {
+                let _ = self.send(chat_id, empty).await;
+            }
             return;
         }
         let count = items.len();
@@ -483,7 +526,7 @@ impl Bot {
         // The button rides on the last chunk, so that is the message an archive
         // press will edit.
         let id = self
-            .remember_pending(items, chunks[chunks.len() - 1].clone())
+            .remember_pending(items, chunks[chunks.len() - 1].clone(), ack_crossing_seq)
             .await;
         let last = chunks.len() - 1;
         for (i, text) in chunks.iter().enumerate() {
@@ -506,7 +549,12 @@ impl Bot {
 
     /// Park a batch under a fresh callback id, evicting the oldest if we are
     /// holding too many unacknowledged ones.
-    async fn remember_pending(&self, items: Vec<ArchivedItem>, message_html: String) -> u64 {
+    async fn remember_pending(
+        &self,
+        items: Vec<ArchivedItem>,
+        message_html: String,
+        ack_crossing_seq: Option<u64>,
+    ) -> u64 {
         let id = self.item_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let mut pending = self.pending.write().await;
         pending.insert(
@@ -514,6 +562,7 @@ impl Bot {
             PendingBatch {
                 items,
                 message_html,
+                ack_crossing_seq,
             },
         );
         if pending.len() > ARCHIVE_CAP {
@@ -567,6 +616,7 @@ impl Bot {
                     }
                 }
                 self.save_archive().await;
+                self.ack_crossings(batch.ack_crossing_seq).await;
                 let note = if count == 1 {
                     "Archived".to_string()
                 } else {
@@ -593,6 +643,21 @@ impl Bot {
                     .await;
             }
         }
+    }
+
+    /// Advance the crossing acknowledgement cursor so a filed batch stops coming
+    /// back from `/crossings`. Only ever moves forward.
+    async fn ack_crossings(&self, seq: Option<u64>) {
+        let Some(seq) = seq else { return };
+        let snapshot = {
+            let mut s = self.settings.write().await;
+            if seq <= s.acked_crossing_seq {
+                return;
+            }
+            s.acked_crossing_seq = seq;
+            s.clone()
+        };
+        self.save_settings(&snapshot).await;
     }
 
     async fn save_archive(&self) {
@@ -1127,10 +1192,11 @@ fn format_crossing(c: &Crossing, tz: i64) -> String {
 
 /// Lay a digest out as one headed message, split into as few chunks as
 /// `MESSAGE_CHARS` allows. An item is never split across two messages, so a
-/// single oversized item just gets a chunk of its own.
+/// single oversized item just gets a chunk of its own. `header` is used verbatim
+/// as the first line.
 fn build_digest(header: &str, items: &[ArchivedItem]) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
-    let mut cur = format!("{header} ({}, newest first)\n\n", items.len());
+    let mut cur = format!("{header}\n\n");
     let mut in_chunk = 0usize;
     for item in items {
         if in_chunk > 0 && cur.chars().count() + item.text.chars().count() + 2 > MESSAGE_CHARS {
@@ -1441,7 +1507,7 @@ Paste a Polymarket link, or:\n\
 <b>Info</b>\n\
 /top — quick summary of current opportunities\n\
 /opportunities — each opportunity as its own message with a ✅ Seen button\n\
-/crossings — recent micro-crossings as one digest with a single ✅ Seen all button\n\
+/crossings — micro-crossings you have not filed yet, as one digest with a single ✅ Seen all button\n\
 /archive — items you marked as seen\n\
 /status — backend health";
 
@@ -1548,7 +1614,7 @@ mod tests {
                 ArchivedItem::new("crossing", format!("⚡ crossing #{i}\n{}", "x".repeat(240)))
             })
             .collect();
-        let chunks = build_digest("⚡ <b>Micro-crossings</b>", &items);
+        let chunks = build_digest("⚡ <b>Micro-crossings</b> (40, newest first)", &items);
 
         assert!(chunks.len() > 1, "40 items must not fit in one message");
         for c in &chunks {
@@ -1560,12 +1626,16 @@ mod tests {
             assert!(joined.contains(&item.text), "item dropped from the digest");
         }
         assert!(chunks[0].starts_with("⚡ <b>Micro-crossings</b> (40, newest first)"));
+        assert!(
+            !chunks[1].starts_with("⚡ <b>Micro-crossings</b>"),
+            "the header belongs to the first chunk only"
+        );
     }
 
     #[test]
     fn single_item_digest_is_one_message() {
         let items = vec![ArchivedItem::new("crossing", "⚡ one".into())];
-        let chunks = build_digest("⚡ <b>Micro-crossings</b>", &items);
+        let chunks = build_digest("⚡ <b>Micro-crossings</b> (1, newest first)", &items);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].ends_with("⚡ one"));
     }
