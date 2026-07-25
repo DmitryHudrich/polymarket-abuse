@@ -98,24 +98,37 @@ impl Gamma {
         Ok(None)
     }
 
-    /// Every active, order-book-enabled market carrying `tag_id`, above
-    /// `min_volume`, up to `cap`. Paginates by rows returned, so it is robust to
-    /// the server's max page size.
+    /// Active, order-book-enabled markets carrying `tag_id`, ordered by volume
+    /// desc, above `min_volume`, up to `cap`.
+    ///
+    /// Gamma rejects offset pagination past ~2000 rows (HTTP 422, "offset too
+    /// large"), so a very large category is capped to its highest-volume markets
+    /// — exactly the ones worth arbing. A page error *after* we already have
+    /// rows is treated as that cap and returns what we have; an error on the
+    /// first page is a real failure and is propagated so the caller does not
+    /// drop markets it merely failed to refresh.
     pub async fn markets_by_tag(
         &self,
         tag_id: &str,
         min_volume: f64,
         cap: usize,
     ) -> Result<Vec<Market>> {
+        const OFFSET_LIMIT: usize = 2000;
         let mut out = Vec::new();
         let mut offset = 0usize;
-        let page = 500usize;
         loop {
             let url = format!(
-                "{}/markets?tag_id={}&active=true&closed=false&limit={}&offset={}&order=volumeNum&ascending=false",
-                self.base, urlencode(tag_id), page, offset
+                "{}/markets?tag_id={}&active=true&closed=false&limit=100&offset={}&order=volumeNum&ascending=false",
+                self.base, urlencode(tag_id), offset
             );
-            let raw: Vec<GammaMarket> = self.get_json(&url).await?;
+            let raw: Vec<GammaMarket> = match self.get_json(&url).await {
+                Ok(r) => r,
+                Err(e) if !out.is_empty() => {
+                    tracing::debug!("tag {tag_id} pagination stopped at offset {offset}: {e}");
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             if raw.is_empty() {
                 break;
             }
@@ -127,7 +140,7 @@ impl Gamma {
                     }
                 }
             }
-            if out.len() >= cap || offset >= 20_000 {
+            if out.len() >= cap || offset >= OFFSET_LIMIT {
                 break;
             }
         }

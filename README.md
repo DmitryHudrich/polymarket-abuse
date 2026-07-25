@@ -187,7 +187,11 @@ the websocket immediately.
 
 **Categories** are the main workflow: add one and the detector auto-pulls all its markets
 from Polymarket, re-checking every `discover_interval_secs` (default 5 min) to add new
-markets and drop resolved ones. **Notification filters** (`/set`, `/mute`) are held per-bot,
+markets and drop resolved ones. Gamma caps offset pagination at ~2000 rows, so a very large
+category is limited to its **~2000 highest-volume** active markets (fetched
+`order=volumeNum desc`) — the ones actually worth arbing; raise `discover_min_volume` to
+focus further. If a category refresh errors partway, that pass keeps existing markets
+rather than dropping them. **Notification filters** (`/set`, `/mute`) are held per-bot,
 persisted to `settings_file`, and applied to every alert. Alerts de-duplicate per market:
 a market re-alerts only when its edge improves by at least `realert_improvement`.
 
