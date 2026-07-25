@@ -17,8 +17,15 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
 
-/// Cap on retained pending (unacknowledged) and archived items.
+/// Cap on retained pending (unacknowledged) batches and archived items.
 const ARCHIVE_CAP: usize = 1000;
+
+/// Target size for one chat message. Telegram's hard limit is 4096 characters,
+/// so a digest longer than this is split across several messages.
+const MESSAGE_CHARS: usize = 3_500;
+
+/// How many recent micro-crossings `/crossings` shows in one digest.
+const CROSSINGS_SHOWN: usize = 25;
 
 /// A signal the user has acknowledged with the "seen" button, kept for `/archive`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +33,24 @@ struct ArchivedItem {
     kind: String,
     text: String,
     created_at: u64,
+}
+
+impl ArchivedItem {
+    fn new(kind: &str, text: String) -> Self {
+        Self {
+            kind: kind.to_string(),
+            text,
+            created_at: now(),
+        }
+    }
+}
+
+/// A batch parked behind a ✅ button: the items it files, plus the HTML of the
+/// message the button sits on — `callback_query.message.text` comes back as
+/// plain text, so editing from it would strip all formatting.
+struct PendingBatch {
+    items: Vec<ArchivedItem>,
+    message_html: String,
 }
 
 fn now() -> u64 {
@@ -90,6 +115,8 @@ struct Crossing {
     peak_avg_edge: f64,
     peak_net: f64,
     peak_size: f64,
+    #[serde(default)]
+    opened_at: u64,
 }
 
 fn mint_strategy() -> String {
@@ -134,6 +161,9 @@ struct Opportunity {
     #[serde(default)]
     end_date: Option<String>,
     arb: Arb,
+    /// When the backend first saw this occurrence (0 on an older backend).
+    #[serde(default)]
+    first_seen: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,8 +180,9 @@ struct Bot {
     settings: RwLock<Settings>,
     settings_path: PathBuf,
     archive_path: PathBuf,
-    /// Items shown with a "seen" button, keyed by the id in their callback_data.
-    pending: RwLock<HashMap<u64, ArchivedItem>>,
+    /// Batches shown with a "seen" button, keyed by the id in their
+    /// callback_data. One press files the whole batch.
+    pending: RwLock<HashMap<u64, PendingBatch>>,
     archive: RwLock<Vec<ArchivedItem>>,
     item_seq: AtomicU64,
 }
@@ -246,7 +277,8 @@ async fn alert_loop(bot: Arc<Bot>) {
             if !fresh {
                 continue;
             }
-            if let Err(e) = bot.send(&bot.cfg.chat_id, &format_alert(o)).await {
+            let text = format_alert(o, bot.cfg.tz_offset_minutes);
+            if let Err(e) = bot.send(&bot.cfg.chat_id, &text).await {
                 tracing::warn!("send alert failed: {e}");
             } else {
                 seen.insert(key, o.arb.gross_edge);
@@ -280,13 +312,18 @@ async fn crossings_loop(bot: Arc<Bot>) {
         if !s.enabled || !s.crossings {
             continue;
         }
-        for c in &resp.crossings {
-            if !s.allows(&c.strategy) || c.peak_avg_edge < s.min_edge {
-                continue;
-            }
-            if let Err(e) = bot.send(&bot.cfg.chat_id, &format_crossing(c)).await {
-                tracing::warn!("send crossing failed: {e}");
-            }
+        // Crossings close in bursts, so everything this poll picked up goes out
+        // as one digest behind a single ✅ button instead of a message each.
+        let items: Vec<ArchivedItem> = resp
+            .crossings
+            .iter()
+            .rev()
+            .filter(|c| s.allows(&c.strategy) && c.peak_avg_edge >= s.min_edge)
+            .map(|c| ArchivedItem::new("crossing", format_crossing(c, bot.cfg.tz_offset_minutes)))
+            .collect();
+        if !items.is_empty() {
+            bot.send_digest(&bot.cfg.chat_id, "⚡ <b>Micro-crossings</b>", items, "")
+                .await;
         }
     }
 }
@@ -358,76 +395,63 @@ impl Bot {
 
     /// Send the current opportunities, one message per item with a "seen" button.
     async fn cmd_opportunities(&self, chat_id: &str) {
-        let items: Vec<(String, String)> = match self.fetch_opportunities().await {
+        let tz = self.cfg.tz_offset_minutes;
+        let items: Vec<ArchivedItem> = match self.fetch_opportunities().await {
             Ok(r) => r
                 .opportunities
                 .iter()
                 .take(15)
-                .map(|o| (format_alert(o), "opportunity".to_string()))
+                .map(|o| ArchivedItem::new("opportunity", format_alert(o, tz)))
                 .collect(),
-            Err(e) => {
-                let _ = self
-                    .send(
-                        chat_id,
-                        &format!("backend unreachable: {}", esc(&e.to_string())),
-                    )
-                    .await;
-                return;
-            }
+            Err(e) => return self.send_backend_error(chat_id, &e).await,
         };
         self.send_items(chat_id, items, "No live opportunities right now.")
             .await;
     }
 
-    /// Send recent micro-crossings, one message per item with a "seen" button.
+    /// Send recent micro-crossings as a single digest with one ✅ button that
+    /// files every listed crossing at once — they are short, numerous and only
+    /// interesting in aggregate, so one message per crossing just floods the chat.
     async fn cmd_crossings(&self, chat_id: &str) {
-        let items: Vec<(String, String)> = match self.fetch_crossings(0, 500).await {
+        let tz = self.cfg.tz_offset_minutes;
+        let items: Vec<ArchivedItem> = match self.fetch_crossings(0, 500).await {
             Ok(r) => r
                 .crossings
                 .iter()
                 .rev()
-                .take(15)
-                .map(|c| (format_crossing(c), "crossing".to_string()))
+                .take(CROSSINGS_SHOWN)
+                .map(|c| ArchivedItem::new("crossing", format_crossing(c, tz)))
                 .collect(),
-            Err(e) => {
-                let _ = self
-                    .send(
-                        chat_id,
-                        &format!("backend unreachable: {}", esc(&e.to_string())),
-                    )
-                    .await;
-                return;
-            }
+            Err(e) => return self.send_backend_error(chat_id, &e).await,
         };
-        self.send_items(chat_id, items, "No micro-crossings recorded yet.")
+        self.send_digest(
+            chat_id,
+            "⚡ <b>Micro-crossings</b>",
+            items,
+            "No micro-crossings recorded yet.",
+        )
+        .await;
+    }
+
+    async fn send_backend_error(&self, chat_id: &str, e: &anyhow::Error) {
+        let _ = self
+            .send(
+                chat_id,
+                &format!("backend unreachable: {}", esc(&e.to_string())),
+            )
             .await;
     }
 
-    /// Send each `(text, kind)` as its own message carrying a "seen" button that
-    /// moves it to the archive when pressed.
-    async fn send_items(&self, chat_id: &str, items: Vec<(String, String)>, empty: &str) {
+    /// Send each item as its own message carrying a "seen" button that moves it
+    /// to the archive when pressed.
+    async fn send_items(&self, chat_id: &str, items: Vec<ArchivedItem>, empty: &str) {
         if items.is_empty() {
             let _ = self.send(chat_id, empty).await;
             return;
         }
-        for (text, kind) in items {
-            let id = self.item_seq.fetch_add(1, Ordering::Relaxed) + 1;
-            {
-                let mut pending = self.pending.write().await;
-                pending.insert(
-                    id,
-                    ArchivedItem {
-                        kind,
-                        text: text.clone(),
-                        created_at: now(),
-                    },
-                );
-                if pending.len() > ARCHIVE_CAP {
-                    if let Some(&oldest) = pending.keys().min() {
-                        pending.remove(&oldest);
-                    }
-                }
-            }
+        for item in items {
+            let text = item.text.clone();
+            let id = self.remember_pending(vec![item], text.clone()).await;
             if let Err(e) = self
                 .send_with_button(chat_id, &text, "✅ Seen", &format!("seen:{id}"))
                 .await
@@ -437,21 +461,85 @@ impl Bot {
         }
     }
 
+    /// Send many items as one digest: as few messages as Telegram's size limit
+    /// allows, with a single ✅ button on the last one that files the whole batch.
+    async fn send_digest(
+        &self,
+        chat_id: &str,
+        header: &str,
+        items: Vec<ArchivedItem>,
+        empty: &str,
+    ) {
+        if items.is_empty() {
+            let _ = self.send(chat_id, empty).await;
+            return;
+        }
+        let count = items.len();
+        let chunks = build_digest(header, &items);
+
+        // The button rides on the last chunk, so that is the message an archive
+        // press will edit.
+        let id = self
+            .remember_pending(items, chunks[chunks.len() - 1].clone())
+            .await;
+        let last = chunks.len() - 1;
+        for (i, text) in chunks.iter().enumerate() {
+            let res = if i == last {
+                self.send_with_button(
+                    chat_id,
+                    text,
+                    &format!("✅ Seen all ({count})"),
+                    &format!("seen:{id}"),
+                )
+                .await
+            } else {
+                self.send(chat_id, text).await
+            };
+            if let Err(e) = res {
+                tracing::warn!("send digest failed: {e}");
+            }
+        }
+    }
+
+    /// Park a batch under a fresh callback id, evicting the oldest if we are
+    /// holding too many unacknowledged ones.
+    async fn remember_pending(&self, items: Vec<ArchivedItem>, message_html: String) -> u64 {
+        let id = self.item_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut pending = self.pending.write().await;
+        pending.insert(
+            id,
+            PendingBatch {
+                items,
+                message_html,
+            },
+        );
+        if pending.len() > ARCHIVE_CAP {
+            if let Some(&oldest) = pending.keys().min() {
+                pending.remove(&oldest);
+            }
+        }
+        id
+    }
+
     async fn cmd_archive(&self) -> String {
         let archive = self.archive.read().await;
         if archive.is_empty() {
             return "Archive is empty. Tap ✅ on a /crossings or /opportunities item to file it."
                 .into();
         }
+        let tz = self.cfg.tz_offset_minutes;
         let mut s = format!("<b>Archive ({} items, newest first)</b>\n\n", archive.len());
         for item in archive.iter().rev().take(10) {
             s.push_str(&item.text);
-            s.push_str("\n\n");
+            s.push_str(&format!(
+                "\n🗂 <i>filed {}</i>\n\n",
+                fmt_time(item.created_at, tz)
+            ));
         }
         s
     }
 
-    /// Handle a "seen" button press: file the item and update its message.
+    /// Handle a "seen" button press: file the whole batch and update its message.
     async fn handle_callback(&self, cq: CallbackQuery) {
         let id = cq
             .data
@@ -459,28 +547,44 @@ impl Bot {
             .and_then(|d| d.strip_prefix("seen:"))
             .and_then(|s| s.parse::<u64>().ok());
 
-        let item = match id {
+        let batch = match id {
             Some(id) => self.pending.write().await.remove(&id),
             None => None,
         };
 
-        match item {
-            Some(item) => {
+        match batch {
+            Some(batch) if !batch.items.is_empty() => {
+                let count = batch.items.len();
                 {
                     let mut archive = self.archive.write().await;
-                    archive.push(item.clone());
-                    while archive.len() > ARCHIVE_CAP {
-                        archive.remove(0);
+                    archive.extend(batch.items);
+                    if archive.len() > ARCHIVE_CAP {
+                        let excess = archive.len() - ARCHIVE_CAP;
+                        archive.drain(..excess);
                     }
                 }
                 self.save_archive().await;
-                let _ = self.answer_callback(&cq.id, "Archived").await;
+                let note = if count == 1 {
+                    "Archived".to_string()
+                } else {
+                    format!("Archived {count} items")
+                };
+                let _ = self.answer_callback(&cq.id, &note).await;
                 if let Some(msg) = cq.message {
-                    let text = format!("{}\n\n🗂 <i>archived</i>", item.text);
+                    let text = format!(
+                        "{}\n\n🗂 <i>archived {} at {}</i>",
+                        batch.message_html,
+                        if count == 1 {
+                            "1 item".to_string()
+                        } else {
+                            format!("{count} items")
+                        },
+                        fmt_time(now(), self.cfg.tz_offset_minutes),
+                    );
                     let _ = self.edit_message(msg.chat.id, msg.message_id, &text).await;
                 }
             }
-            None => {
+            _ => {
                 let _ = self
                     .answer_callback(&cq.id, "Expired (bot restarted)")
                     .await;
@@ -887,7 +991,7 @@ impl Bot {
             Ok(r) if !r.opportunities.is_empty() => {
                 let mut s = String::from("<b>Top opportunities</b>\n\n");
                 for o in r.opportunities.iter().take(5) {
-                    s.push_str(&format_alert(o));
+                    s.push_str(&format_alert(o, self.cfg.tz_offset_minutes));
                     s.push_str("\n\n");
                 }
                 s
@@ -937,7 +1041,7 @@ impl Bot {
     }
 }
 
-fn format_alert(o: &Opportunity) -> String {
+fn format_alert(o: &Opportunity, tz: i64) -> String {
     let a = &o.arb;
     let split = a.strategy == "split";
     // Headline is the volume-weighted edge that actually clears at `size`; the
@@ -981,7 +1085,7 @@ fn format_alert(o: &Opportunity) -> String {
          {plan}\n\
          fees: <code>${fees:.2}</code> (2 taker legs)  gas: <code>${gas:.2}</code>\n\
          {book_label}: YES <code>{yes:.4}</code> + NO <code>{no:.4}</code> = <code>{sum:.4}</code> (edge {edge:.4})\n\
-         volume: <code>${vol:.0}</code>{resolves}\n\
+         volume: <code>${vol:.0}</code>{spotted}{resolves}\n\
          <a href=\"{url}\">open market</a>",
         header = header,
         q = esc(&o.question),
@@ -998,29 +1102,143 @@ fn format_alert(o: &Opportunity) -> String {
         sum = a.sum,
         edge = a.gross_edge,
         vol = o.volume,
+        spotted = fmt_spotted(o.first_seen, tz),
         resolves = resolves,
         url = esc(&o.market_url),
     )
 }
 
-fn format_crossing(c: &Crossing) -> String {
+fn format_crossing(c: &Crossing, tz: i64) -> String {
     let direction = if c.strategy == "split" {
         "split &amp; sell"
     } else {
         "buy set"
     };
     format!(
-        "⚡ <b>Micro-crossing</b> ({direction})\n<b>{q}</b>\n\
-         lived <b>{ms} ms</b>  peak edge <b>{edge:.3}</b>\n\
-         size <code>{size:.0}</code>  would-be net <code>${net:.2}</code>\n\
+        "⚡ <b>{q}</b> ({direction})\n\
+         spotted <b>{at}</b>, lived <b>{ms} ms</b>, peak edge <b>{edge:.3}</b>\n\
+         size <code>{size:.0}</code>  would-be net <code>${net:.2}</code>  \
          <a href=\"{url}\">open market</a>",
-        direction = direction,
         q = esc(&c.question),
+        direction = direction,
+        at = fmt_time(c.opened_at, tz),
         ms = c.lived_ms,
         edge = c.peak_avg_edge,
         size = c.peak_size,
         net = c.peak_net,
         url = esc(&c.market_url),
+    )
+}
+
+/// Lay a digest out as one headed message, split into as few chunks as
+/// `MESSAGE_CHARS` allows. An item is never split across two messages, so a
+/// single oversized item just gets a chunk of its own.
+fn build_digest(header: &str, items: &[ArchivedItem]) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = format!("{header} ({}, newest first)\n\n", items.len());
+    let mut in_chunk = 0usize;
+    for item in items {
+        if in_chunk > 0 && cur.chars().count() + item.text.chars().count() + 2 > MESSAGE_CHARS {
+            chunks.push(std::mem::take(&mut cur));
+            in_chunk = 0;
+        }
+        cur.push_str(&item.text);
+        cur.push_str("\n\n");
+        in_chunk += 1;
+    }
+    chunks.push(cur);
+    for c in chunks.iter_mut() {
+        while c.ends_with('\n') {
+            c.pop();
+        }
+    }
+    chunks
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Civil `(year, month, day)` from days since the epoch — Howard Hinnant's
+/// `civil_from_days`, so timestamps can be rendered without a date crate.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// Wall-clock `(year, month, day, hour, minute, second)` at the configured UTC offset.
+fn wall_clock(ts: u64, offset_minutes: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let local = ts as i64 + offset_minutes * 60;
+    let (y, m, d) = civil_from_days(local.div_euclid(86_400));
+    let secs = local.rem_euclid(86_400);
+    (
+        y,
+        m,
+        d,
+        (secs / 3_600) as u32,
+        (secs % 3_600 / 60) as u32,
+        (secs % 60) as u32,
+    )
+}
+
+/// `UTC`, `UTC+3`, `UTC-5:30` — appended so a bare clock time is never ambiguous.
+fn tz_label(offset_minutes: i64) -> String {
+    if offset_minutes == 0 {
+        return "UTC".into();
+    }
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let (h, m) = (offset_minutes.abs() / 60, offset_minutes.abs() % 60);
+    if m == 0 {
+        format!("UTC{sign}{h}")
+    } else {
+        format!("UTC{sign}{h}:{m:02}")
+    }
+}
+
+/// A timestamp for chat: `16:23:41 UTC+3` today, `25 Jul 16:23:41 UTC+3` otherwise,
+/// so live alerts stay short while archived ones stay unambiguous.
+fn fmt_time(ts: u64, offset_minutes: i64) -> String {
+    if ts == 0 {
+        return "unknown".into();
+    }
+    let (y, m, d, hh, mm, ss) = wall_clock(ts, offset_minutes);
+    let (ny, nm, nd, ..) = wall_clock(now(), offset_minutes);
+    let tz = tz_label(offset_minutes);
+    let month = MONTHS[(m as usize - 1).min(11)];
+    if (y, m, d) == (ny, nm, nd) {
+        format!("{hh:02}:{mm:02}:{ss:02} {tz}")
+    } else {
+        format!("{d} {month} {hh:02}:{mm:02}:{ss:02} {tz}")
+    }
+}
+
+/// Coarse "how long ago", e.g. `4s`, `3m 20s`, `2h 05m`, `1d 3h`.
+fn fmt_age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3_600 => format!("{}m {:02}s", s / 60, s % 60),
+        s if s < 86_400 => format!("{}h {:02}m", s / 3_600, s % 3_600 / 60),
+        s => format!("{}d {}h", s / 86_400, s % 86_400 / 3_600),
+    }
+}
+
+/// "spotted: <time> (<age> ago)" — how long the opportunity has been standing.
+fn fmt_spotted(ts: u64, offset_minutes: i64) -> String {
+    if ts == 0 {
+        return String::new();
+    }
+    format!(
+        "\nspotted: <b>{}</b> ({} ago)",
+        fmt_time(ts, offset_minutes),
+        fmt_age(now().saturating_sub(ts))
     )
 }
 
@@ -1112,9 +1330,78 @@ Paste a Polymarket link, or:\n\
 <b>Info</b>\n\
 /top — quick summary of current opportunities\n\
 /opportunities — each opportunity as its own message with a ✅ Seen button\n\
-/crossings — recent micro-crossings, each with a ✅ Seen button\n\
+/crossings — recent micro-crossings as one digest with a single ✅ Seen all button\n\
 /archive — items you marked as seen\n\
 /status — backend health";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_dates_match_known_timestamps() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2026-07-25T16:23:41Z = 1784996621
+        assert_eq!(wall_clock(1_784_996_621, 0), (2026, 7, 25, 16, 23, 41));
+        // Leap day, and the offset rolling the date backwards over midnight.
+        assert_eq!(wall_clock(1_709_164_800, 0), (2024, 2, 29, 0, 0, 0));
+        assert_eq!(wall_clock(1_709_164_800, -180), (2024, 2, 28, 21, 0, 0));
+        // Fractional offset (UTC+5:30).
+        assert_eq!(wall_clock(1_784_996_621, 330), (2026, 7, 25, 21, 53, 41));
+    }
+
+    #[test]
+    fn tz_labels_read_the_way_people_write_them() {
+        assert_eq!(tz_label(0), "UTC");
+        assert_eq!(tz_label(180), "UTC+3");
+        assert_eq!(tz_label(-300), "UTC-5");
+        assert_eq!(tz_label(330), "UTC+5:30");
+    }
+
+    #[test]
+    fn ages_stay_short() {
+        assert_eq!(fmt_age(4), "4s");
+        assert_eq!(fmt_age(200), "3m 20s");
+        assert_eq!(fmt_age(7_500), "2h 05m");
+        assert_eq!(fmt_age(97_200), "1d 3h");
+    }
+
+    #[test]
+    fn digest_fits_telegram_and_keeps_every_item() {
+        let items: Vec<ArchivedItem> = (0..40)
+            .map(|i| {
+                ArchivedItem::new("crossing", format!("⚡ crossing #{i}\n{}", "x".repeat(240)))
+            })
+            .collect();
+        let chunks = build_digest("⚡ <b>Micro-crossings</b>", &items);
+
+        assert!(chunks.len() > 1, "40 items must not fit in one message");
+        for c in &chunks {
+            assert!(c.chars().count() <= 4_096, "chunk exceeds Telegram's limit");
+            assert!(!c.ends_with('\n'), "trailing blank lines were trimmed");
+        }
+        let joined = chunks.join("\n");
+        for item in &items {
+            assert!(joined.contains(&item.text), "item dropped from the digest");
+        }
+        assert!(chunks[0].starts_with("⚡ <b>Micro-crossings</b> (40, newest first)"));
+    }
+
+    #[test]
+    fn single_item_digest_is_one_message() {
+        let items = vec![ArchivedItem::new("crossing", "⚡ one".into())];
+        let chunks = build_digest("⚡ <b>Micro-crossings</b>", &items);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].ends_with("⚡ one"));
+    }
+
+    #[test]
+    fn unknown_timestamps_do_not_render_as_1970() {
+        // An older backend omits `first_seen`, which serde fills with 0.
+        assert_eq!(fmt_time(0, 180), "unknown");
+        assert!(fmt_spotted(0, 180).is_empty());
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct TgResponse<T> {

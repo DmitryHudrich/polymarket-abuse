@@ -185,6 +185,8 @@ one-offs.
 | Only profitable | `only_profitable` | `TELEGRAM_ONLY_PROFITABLE` | `true` |
 | Re-alert improvement | `realert_improvement` | `TELEGRAM_REALERT_IMPROVEMENT` | `0.01` |
 | Settings file | `settings_file` | `TELEGRAM_SETTINGS_FILE` | `bot-settings.json` |
+| Archive file | `archive_file` | `TELEGRAM_ARCHIVE_FILE` | `bot-archive.json` |
+| Timezone (hours from UTC) | `tz_offset_hours` | `TELEGRAM_TZ_OFFSET_HOURS` | `0` (UTC) |
 | Log level | `log_level` | `TELEGRAM_LOG_LEVEL` | `info` |
 
 The `alert_*` / `only_profitable` values are just the **initial** notification filters;
@@ -223,8 +225,8 @@ the websocket immediately.
 | `/mute`, `/unmute` | Pause / resume alerts |
 | `/top` | Quick combined summary of current opportunities |
 | `/opportunities` | Each opportunity as its own message with a ✅ *seen* button |
-| `/crossings` | Recent micro-crossings, each with a ✅ *seen* button |
-| `/archive` | Items you marked as seen (bounded, persisted) |
+| `/crossings` | The recent micro-crossings as **one digest** with a single ✅ *seen all* button |
+| `/archive` | Items you marked as seen, with the time they were filed (bounded, persisted) |
 | `/status` | Backend health (ws connected, watched/category counts) |
 | `/help`, `/start` | Usage (shows the build's commit hash as `first…last`) |
 
@@ -239,6 +241,18 @@ persisted to `settings_file`, and applied to every alert; `mint` and `split` tog
 arb directions independently (both on by default). Alerts de-duplicate per market *and*
 direction: a market re-alerts on a given direction only when that direction's edge improves
 by at least `realert_improvement`.
+
+**Timestamps.** Every alert carries `spotted: <time> (<age> ago)` — when the backend *first*
+saw this occurrence of the opportunity, not when the message was sent, so a re-alert still
+shows how long the edge has been standing. An opportunity that disappears and comes back
+counts as a new occurrence. Micro-crossings show the moment they opened alongside how long
+they lived. Times are rendered at `tz_offset_hours` and always carry their zone
+(`16:23:41 UTC+3`), with the date added once an item is no longer from today.
+
+**Micro-crossings arrive as a digest**, not one message each: they close in bursts and are
+only interesting in aggregate. Each digest (from `/crossings` or from a live poll) gets a
+single **✅ Seen all** button that files every crossing in it to the archive at once; a
+digest too long for one Telegram message is split, with the button on the last part.
 
 ## REST API
 
@@ -259,7 +273,8 @@ by at least `realert_improvement`.
 `GET /opportunities` filters: `profitable=true|false`, `min_edge=<f>`, `min_profit=<f>`,
 `strategy=mint|split`, `limit=<n>`. Each opportunity carries market metadata plus an `arb`
 object (`strategy`, `best_yes`, `best_no`, `sum`, `gross_edge`, `size`, `cost`, `payout`,
-`fees`, `gas`, `net_profit`, `roi`, `avg_edge`, `profitable`).
+`fees`, `gas`, `net_profit`, `roi`, `avg_edge`, `profitable`), plus `first_seen` (unix
+seconds, when this occurrence appeared) and `updated_at` (last recompute).
 
 `strategy` is `mint` (best_yes/best_no are **asks**, `cost` is the ladder spend, `payout`
 is `size`) or `split` (best_yes/best_no are **bids**, `cost` is `size` — $1 per minted set

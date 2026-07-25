@@ -187,6 +187,9 @@ pub struct Opportunity {
     pub market_url: String,
     pub end_date: Option<String>,
     pub arb: ArbResult,
+    /// When this occurrence of the opportunity first appeared. Preserved across
+    /// recomputes and reset only when it disappears and later comes back.
+    pub first_seen: u64,
     pub updated_at: u64,
 }
 
@@ -424,8 +427,15 @@ impl AppState {
         map: &RwLock<HashMap<String, Opportunity>>,
         arb: Option<&ArbResult>,
     ) {
+        // One write lock for read-then-insert so a concurrent recompute of the
+        // same market can't reset `first_seen`.
+        let mut map = map.write().await;
         match arb {
             Some(arb) => {
+                let ts = now();
+                let first_seen = map
+                    .get(&market.condition_id)
+                    .map_or(ts, |prev| prev.first_seen);
                 let opp = Opportunity {
                     question: market.question.clone(),
                     slug: market.slug.clone(),
@@ -436,12 +446,13 @@ impl AppState {
                     market_url: market.market_url(),
                     end_date: market.end_date.clone(),
                     arb: arb.clone(),
-                    updated_at: now(),
+                    first_seen,
+                    updated_at: ts,
                 };
-                map.write().await.insert(market.condition_id.clone(), opp);
+                map.insert(market.condition_id.clone(), opp);
             }
             None => {
-                map.write().await.remove(&market.condition_id);
+                map.remove(&market.condition_id);
             }
         }
     }

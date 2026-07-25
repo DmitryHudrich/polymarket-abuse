@@ -26,6 +26,9 @@ pub struct Config {
     pub realert_improvement: f64,
     pub settings_file: PathBuf,
     pub archive_file: PathBuf,
+    /// Offset applied to every timestamp shown in chat, in minutes east of UTC.
+    /// Configured in (possibly fractional) hours, so `5.5` → `330`.
+    pub tz_offset_minutes: i64,
     pub log_level: String,
 }
 
@@ -43,6 +46,7 @@ impl Default for Config {
             realert_improvement: 0.01,
             settings_file: "bot-settings.json".into(),
             archive_file: "bot-archive.json".into(),
+            tz_offset_minutes: 0,
             log_level: "info".into(),
         }
     }
@@ -62,6 +66,7 @@ pub struct PartialConfig {
     pub realert_improvement: Option<f64>,
     pub settings_file: Option<PathBuf>,
     pub archive_file: Option<PathBuf>,
+    pub tz_offset_hours: Option<f64>,
     pub log_level: Option<String>,
 }
 
@@ -84,6 +89,7 @@ impl PartialConfig {
             realert_improvement,
             settings_file,
             archive_file,
+            tz_offset_hours,
             log_level
         );
         self
@@ -102,6 +108,7 @@ impl PartialConfig {
             realert_improvement: env_parse("TELEGRAM_REALERT_IMPROVEMENT"),
             settings_file: env_str("TELEGRAM_SETTINGS_FILE").map(PathBuf::from),
             archive_file: env_str("TELEGRAM_ARCHIVE_FILE").map(PathBuf::from),
+            tz_offset_hours: env_parse("TELEGRAM_TZ_OFFSET_HOURS"),
             log_level: env_str("TELEGRAM_LOG_LEVEL"),
         }
     }
@@ -120,6 +127,9 @@ impl PartialConfig {
             realert_improvement: self.realert_improvement.unwrap_or(d.realert_improvement),
             settings_file: self.settings_file.unwrap_or(d.settings_file),
             archive_file: self.archive_file.unwrap_or(d.archive_file),
+            tz_offset_minutes: self
+                .tz_offset_hours
+                .map_or(d.tz_offset_minutes, |h| (h * 60.0).round() as i64),
             log_level: self.log_level.unwrap_or(d.log_level),
         }
     }
@@ -158,6 +168,9 @@ pub struct Cli {
     pub settings_file: Option<PathBuf>,
     #[arg(long)]
     pub archive_file: Option<PathBuf>,
+    /// Hours east of UTC for timestamps shown in chat (e.g. 3, -5, 5.5).
+    #[arg(long)]
+    pub tz_offset_hours: Option<f64>,
     #[arg(long)]
     pub log_level: Option<String>,
 }
@@ -176,6 +189,7 @@ impl Cli {
             realert_improvement: self.realert_improvement,
             settings_file: self.settings_file,
             archive_file: self.archive_file,
+            tz_offset_hours: self.tz_offset_hours,
             log_level: self.log_level,
         };
         (self.config, p)

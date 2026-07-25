@@ -15,4 +15,8 @@ alert_min_profit: 1.0      # minimum net USDC profit to alert
 only_profitable: true      # ignore opportunities that don't clear costs
 realert_improvement: 0.01  # re-alert same market only if edge improves by this
 
+# Timestamps shown in chat ("spotted 16:23:41 UTC+3"). Hours east of UTC;
+# fractional zones work too (5.5 = UTC+5:30). 0 = UTC.
+tz_offset_hours: 0
+
 log_level: "info"
