@@ -22,6 +22,8 @@
 //! stale/desynced snapshots. Coherence filtering for that lives in the detector,
 //! not here.
 
+pub mod time;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

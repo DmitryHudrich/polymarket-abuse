@@ -15,16 +15,23 @@ independent binaries:
 Polymarket CLOB websocket (order books)      Gamma REST (resolve link / search, cold path)
         │  stream                                     │
         ▼                                             ▼
-   ┌────────────────────────────────────────────────────┐
-   │ detector  — live books → arb math → opportunities   │
-   └───────────────┬──────────────────────┬─────────────┘
-       REST /watch,/search (manage)   REST /opportunities (poll)
-                   │                      │
-                   ▼                      ▼
+   ┌────────────────────────────────────────────────────┐        ┌──────────────┐
+   │ detector  — live books → arb math → opportunities   │───────▶│  ClickHouse  │
+   └───────────────┬──────────────────────┬─────────────┘  batch │  (own        │
+       REST /watch,/search (manage)   REST /opportunities   write │   container) │
+                   │                      │   /analytics/* ◀──────└──────────────┘
+                   ▼                      ▼         │        query
               ┌──────────────┐   Bot API   ┌──────────┐
               │ telegram-bot │ ───────────▶│ Telegram │
-              └──────────────┘             └──────────┘
+              │  + charts    │   photos    └──────────┘
+              └──────────────┘
 ```
+
+The detector owns ClickHouse; the bot never talks to it, so store credentials
+stay in one process and the bot keeps talking only to the backend and the
+Telegram API. Writes are fire-and-forget — analytics is a diary, never a
+dependency, and a ClickHouse that is down, slow or simply not configured cannot
+delay or break an alert.
 
 ### Why websockets
 
@@ -111,7 +118,8 @@ rare and fleeting.
 - **Competition.** This is a crowded trade; edges are small and vanish in well under a
   second. This tool is a *detector/alerter* — treat alerts as a live feed of where and how
   often mispricings appear, and as the signal layer you would build an (out-of-scope)
-  execution layer on top of.
+  execution layer on top of. Don't take that on faith either: `/decay` measures it on your
+  own feed, and a median lifetime in the low hundreds of milliseconds is the answer.
 - **Latency & colocation.** Polymarket sits behind Cloudflare and its matching engine has
   historically been UK-hosted (where Polymarket is geo-blocked), complicating naive
   colocation. A Dublin VPS is a common compromise — but **measure the real path first**
@@ -130,11 +138,120 @@ rare and fleeting.
   approvals/USDC bridging friction, market invalidation. None are handled here because the
   project intentionally stops at detection.
 
+## Analytics
+
+Alerts tell you what is happening now; they cannot tell you *why the last month
+looked the way it did*. Every signal is therefore also written to ClickHouse, and
+the bot renders that history as charts in chat.
+
+### What is measured, and what cannot be
+
+The metrics split into layers, and it matters which of them this project is in a
+position to observe. **It never places an order**, so anything that only exists
+once you have traded is modelled, not realised:
+
+| Layer | Recorded | How |
+|---|---|---|
+| **Market state at the signal** | ✅ measured | both books' top *N* levels each side, per-leg spreads, `ask_sum`/`bid_sum`, resting notional, level counts, snapshot age |
+| **Traded volume** | ⚠️ best effort | trade prints seen on the market channel (`last_trade_price`), as a rolling 5-minute count and notional. If the feed stops carrying them this reads 0 — no separate subscription is made |
+| **Edge** | ✅ measured | `gross_edge` (top of book) and `avg_edge` (what actually clears at size), per occurrence |
+| **Edge decay** | ✅ measured | every crossing's lifetime, time-to-peak, observation count, and the gap since the same market last produced one |
+| **Costs** | ⚠️ modelled | the fee/slippage/gas *parameters in force* are stored on every row, so a later re-read knows what the numbers assumed. Real gas prices and real fills are not observable from here |
+| **Capital & risk** | ⚠️ modelled | capital the trade would lock, and seconds to resolution (the opportunity cost of holding a set instead of merging) |
+| **Detection latency** | ✅ measured | websocket frame → opportunity stored, per signal. This is the detector's own share of signal-to-action, not a round trip to an exchange |
+| **Execution, slippage, toxic fills** | ❌ not observable | no order is ever placed |
+
+That last row is the honest one. Quoted-vs-filled price, block confirmation
+times, real gas, partial and toxic fills are properties of *executing*, and this
+repo stops at detection. The `executions` table exists and is fully specified
+anyway, so an out-of-scope execution layer can `POST /analytics/execution` and
+have its fills line up against the signals that produced them via
+`opportunity_id`, with no migration and no schema archaeology. Until then it
+stays empty and every execution view says so.
+
+### Storage
+
+One database, `arb`, in its own container. The schema is applied by the detector
+on every boot (`CREATE … IF NOT EXISTS`), so it travels with the binary rather
+than with a container init script that only runs on a fresh volume.
+
+| Table | One row per | Ordered by |
+|---|---|---|
+| `opportunities` | observation of a live arb (`open` / `update` / `close`) | `(condition_id, ts)` |
+| `crossings` | arb that has **closed**, with its lifetime | `(condition_id, closed_at)` |
+| `book_samples` | periodic probe of a watched market, arb or not | `(condition_id, ts)` |
+| `trades` | observed trade print | `(condition_id, ts)` |
+| `executions` | leg of a real trade — **empty here** | `(condition_id, ts)` |
+
+Wide and denormalised, the shape ClickHouse rewards: an `opportunities` row is
+self-contained, so "what did the book look like when this edge existed" never
+needs a join. Everything is `PARTITION BY toYYYYMMDD(...)` with a TTL
+(`analytics_ttl_days`, default 90) that drops whole partitions.
+
+Three `AggregatingMergeTree` rollups sit on top — `hourly`, `market_daily`,
+`book_hourly`. Be clear about which of these earns its keep: at this project's
+event rate the opportunity rollups are headroom, because real set-arb is rare
+and `opportunities` stays small. **`book_hourly` is the one that matters now** —
+a full watchlist sampled every few minutes is hundreds of thousands of rows a
+day, and the liquidity views read the rollup instead of the raw table.
+
+Two things about the write path are deliberate:
+
+- **A standing arb is throttled.** It is re-evaluated on every book delta, so
+  only one `update` row per `analytics_sample_ms` (default 500) is kept while it
+  stands. Without this a single busy market would be the entire dataset. The
+  `open` and `close` of every occurrence are always recorded, and `open` is what
+  every query counts as "an occurrence".
+- **Describing the market state is skipped unless a row will come of it.**
+  Cutting four ladders costs a sort and a lock, so it only happens when an arb is
+  live or has just closed. Every other recompute — the overwhelming majority —
+  never touches analytics at all.
+
+### In chat
+
+`/analytics` opens a menu; every view is also a command, and any of them takes a
+window (`24h`, `7d`, `30d`, `90d`):
+
+| Command | Chart | The question it answers |
+|---|---|---|
+| `/report [w]` | dashboard | everything at a glance, one image |
+| `/edge [w]` | edge distribution + retention curve | **should I arb from 0.5% or from 2%?** The lower panel is the share of occurrences a given cut-off keeps, so a cliff in it is a threshold worth sitting just below |
+| `/decay [w]` | lifetime histogram + survival curve | **can I technically compete at all?** If the mass sits left of a few hundred ms, it is a latency race, not an edge you can size into |
+| `/timeline [w]` | count and average edge over time | when the feed was busy, and whether the edges were fat or thin |
+| `/markets [w]` | top markets by occurrence | which markets actually produce edges — with median lifetime beside the count, because frequency alone is not opportunity |
+| `/heatmap [w]` | weekday × hour | when opportunities appear, in your timezone |
+| `/size [w]` | realised vs top-of-book edge by size | **does my own size eat the edge?** The bar is what clears; the gap up to the marker is your own sweep down the ladder |
+| `/stats [w]` | — | the same numbers as text |
+| `/export <table> [w]` | — | raw rows as a CSV file |
+
+Each chart arrives as a PNG with a window switcher underneath, and a caption
+carrying the same headline numbers it plots — a picture is not a readable data
+source on its own, so nothing here is reachable only by looking at colour.
+`/stats` and `/export` are the full text and machine-readable paths.
+
+Charts are rendered in-process to PNG with the two Noto Sans faces vendored in
+`crates/telegram-bot/assets/` (OFL, licence alongside them) compiled into the
+binary. No browser, no network, and no fonts or fontconfig in the runtime image.
+
+### Reading the charts against the trade
+
+The honest use of this data is mostly negative — it is very good at telling you
+an edge was never takeable:
+
+- A median lifetime well under a second, with the mass of the decay curve in the
+  first buckets, means the edge closed before any non-colocated executor could
+  have acted. Frequency in that regime is not opportunity.
+- A retention curve that falls off a cliff early means most of the feed is
+  marginal; raising the cut-off costs little and each surviving signal has to
+  carry only one fixed gas leg.
+- A large depth haircut in the size chart means the headline edge is
+  top-of-book fiction at the size you would actually want.
+
 ## Build
 
 ```bash
 cargo build --release
-cargo test -p arb-core   # arbitrage math unit tests
+cargo test --all   # arbitrage math, analytics queries, chart rendering
 ```
 
 Binaries: `target/release/{detector,telegram-bot}`.
@@ -170,6 +287,16 @@ one-offs.
 | Max capital (USDC) | `max_capital` | `DETECTOR_MAX_CAPITAL` | `1000` |
 | Min net profit | `min_profit` | `DETECTOR_MIN_PROFIT` | `0` |
 | Min gross edge | `min_edge` | `DETECTOR_MIN_EDGE` | `0` |
+| ClickHouse URL *(empty = analytics off)* | `clickhouse_url` | `DETECTOR_CLICKHOUSE_URL` | *(empty)* |
+| ClickHouse database | `clickhouse_db` | `DETECTOR_CLICKHOUSE_DB` | `arb` |
+| ClickHouse user / password | `clickhouse_user` / `clickhouse_password` | `DETECTOR_CLICKHOUSE_USER` / `_PASSWORD` | `default` / *(empty)* |
+| Live-arb sample gap (ms) | `analytics_sample_ms` | `DETECTOR_ANALYTICS_SAMPLE_MS` | `500` |
+| Book probe interval (s, 0=off) | `analytics_book_sample_secs` | `DETECTOR_ANALYTICS_BOOK_SAMPLE_SECS` | `300` |
+| Trade window (s) | `analytics_trade_window_secs` | `DETECTOR_ANALYTICS_TRADE_WINDOW_SECS` | `300` |
+| Book levels captured per side | `analytics_depth_levels` | `DETECTOR_ANALYTICS_DEPTH_LEVELS` | `5` |
+| Insert batch / flush (s) | `analytics_batch_rows` / `analytics_flush_secs` | `DETECTOR_ANALYTICS_BATCH_ROWS` / `_FLUSH_SECS` | `500` / `2` |
+| Queue cap (rows) | `analytics_queue_cap` | `DETECTOR_ANALYTICS_QUEUE_CAP` | `50000` |
+| Retention (days) | `analytics_ttl_days` | `DETECTOR_ANALYTICS_TTL_DAYS` | `90` |
 
 ### telegram-bot
 
@@ -228,6 +355,10 @@ the websocket immediately.
 | `/crossings` | Micro-crossings you have not filed yet, as **one digest** with a single ✅ *seen all* button |
 | `/archive` | Items you marked as seen, with the time they were filed (bounded, persisted) |
 | `/status` | Backend health (ws connected, watched/category counts) |
+| `/analytics [window]` | Menu of every analytics view, with a window switcher |
+| `/report`, `/edge`, `/decay`, `/timeline`, `/markets`, `/heatmap`, `/size` | The charts, each also accepting a window (`/edge 30d`) |
+| `/stats [window]` | The analytics summary as text |
+| `/export <table> [window]` | Raw rows as CSV (`opportunities`, `crossings`, `book_samples`, `trades`, `executions`) |
 | `/help`, `/start` | Usage (shows the build's commit hash as `first…last`) |
 
 **Categories** are the main workflow: add one and the detector auto-pulls all its markets
@@ -280,6 +411,26 @@ older entries stranded behind it.
 | `POST /watch` | Pin a single market — body `{"input":"<link\|slug\|condition_id>"}` |
 | `DELETE /watch/:key` | Unpin a market by slug or condition id |
 | `GET /search?q=&limit=` | Search markets |
+| `GET /analytics/health` | Analytics state: enabled, schema ready, rows written/dropped |
+| `GET /analytics/summary` | Per-strategy headline numbers plus lifetimes and coverage |
+| `GET /analytics/edge_histogram` | Edge distribution, bucketed |
+| `GET /analytics/decay` | Crossing lifetimes, bucketed, with quantiles |
+| `GET /analytics/timeline` | Count and average edge per time bucket |
+| `GET /analytics/markets` | Per-market frequency, edge and median lifetime |
+| `GET /analytics/categories` | Rollup by market category and liquidity tier |
+| `GET /analytics/heatmap` | Weekday × hour counts, at a `tz` offset |
+| `GET /analytics/size_curve` | Realised vs top-of-book edge by position size |
+| `GET /analytics/liquidity` | Baseline spread/depth from the hourly book rollup |
+| `GET /analytics/executions` | Realised execution quality — empty unless something posts to it |
+| `GET /analytics/export?table=` | Raw rows as CSV |
+| `POST /analytics/execution` | Log one leg of a real trade (for an out-of-scope executor) |
+
+Analytics endpoints take `window=` (`30m`, `24h`, `7d`, `90d`, or bare seconds)
+and, where it applies, `strategy=mint|split`, `limit=`, `bucket=`, `bins=`,
+`bucket_secs=`, `tz=` (minutes east of UTC). They answer `503` while analytics is
+disabled or still connecting, so the bot can say so plainly. Every value that
+reaches a query is a clamped number or a whitelisted identifier — none of it is
+interpolated caller text.
 
 `GET /opportunities` filters: `profitable=true|false`, `min_edge=<f>`, `min_profit=<f>`,
 `strategy=mint|split`, `limit=<n>`. Each opportunity carries market metadata plus an `arb`
@@ -307,6 +458,29 @@ docker compose up -d --build
 The detector's watchlist is persisted to a named volume (`arb-data`), the bot
 reaches the detector over the Compose network (`http://detector:8080`), and the
 detector's port is published only on `127.0.0.1`.
+
+**ClickHouse runs as its own service** (`clickhouse`, volume `clickhouse-data`,
+port published on loopback only). Compose points the detector at it and creates
+the `arb` database; the detector applies the schema itself and retries until the
+server answers, so `docker compose up` in any order works and a ClickHouse that
+never comes up costs you analytics, not alerts. Change the credentials by setting
+`DETECTOR_CLICKHOUSE_USER`/`_PASSWORD` in `.env` — the defaults are `arb`/`arb`
+and are only safe because nothing is exposed off-host.
+
+Stock ClickHouse assumes it owns the machine and will reserve most of the RAM
+for caches, which is wrong on a box also running the detector and the bot.
+`clickhouse/config.d/low-resources.xml` caps it at ~1 GiB, trims the background
+pools, and drops the system logs nothing here reads. Raise those if you give
+analytics its own host.
+
+Ad-hoc SQL from the box, when you want something the charts do not cover:
+
+```bash
+curl 'http://localhost:8123/?user=arb&password=arb' \
+  -d "SELECT strategy, count(), round(quantile(0.5)(lived_ms)) AS median_ms
+      FROM arb.crossings WHERE closed_at >= now() - INTERVAL 7 DAY
+      GROUP BY strategy"
+```
 
 ### CI/CD (GitHub Actions)
 
@@ -349,18 +523,33 @@ commit SHA on each run; `.env` stays on the VPS and is never overwritten.
 ```
 crates/
   core/          arbitrage math + types (pure, unit-tested)
+    time.rs      calendar arithmetic shared by both binaries
   detector/
     config.rs    layered config
     gamma.rs     Gamma REST: resolve link/slug, search (cold path)
     ws.rs        CLOB websocket: live books + recompute
     state.rs     watchlist, live books, opportunities, persistence
+    analytics/   ClickHouse: schema, batched writer, query layer
     main.rs      REST server wiring
-  telegram-bot/  standalone alerter + watchlist commands
+  telegram-bot/
+    analytics.rs fetch aggregates, caption them, push to chat
+    charts/      PNG rendering (canvas primitives + the chart set)
+    assets/      vendored Noto Sans faces (OFL)
+    main.rs      alerter + watchlist commands
 config/          example YAML for each binary
+clickhouse/      container config (resource caps for a small VPS)
 ```
 
 ## Scope
 
-This project is deliberately **detection and alerting only**. It reads public market data
-and reports opportunities. It does not connect a wallet, hold keys, submit orders, or move
-funds, and it is not trading advice.
+This project is deliberately **detection, alerting and analysis only**. It reads public
+market data, reports opportunities, and keeps a history of them so you can judge whether
+the trade is worth building. It does not connect a wallet, hold keys, submit orders, or
+move funds, and it is not trading advice.
+
+The analytics is scoped the same way. It measures what a detector can see — book state,
+edge, how long the edge lived, how fast it was spotted — and is explicit that costs and
+capital are *modelled* from the configured parameters, not realised. Slippage, gas,
+confirmation latency and toxic fills belong to execution; the `executions` table is
+specified and reachable over `POST /analytics/execution` so an external executor can fill
+it in, and it stays empty until one does.

@@ -3,6 +3,7 @@
 //! exposes opportunities plus watchlist management over REST. It never places,
 //! signs or funds any order.
 
+mod analytics;
 mod config;
 mod gamma;
 mod state;
@@ -14,12 +15,14 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use crate::analytics::{query as aq, Analytics, ExecutionRow, Row};
 use crate::gamma::Gamma;
-use crate::state::{now, AppState, Market};
+use crate::state::{now, now_ms, AppState, Market};
 
 #[derive(Clone)]
 struct App {
@@ -41,8 +44,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Arc::new(cfg);
     let gamma = Arc::new(Gamma::new(cfg.gamma_url.clone(), cfg.http_timeout_secs)?);
-    let state = AppState::new(cfg.clone());
+    let analytics = Analytics::start(cfg.analytics.clone(), cfg.http_timeout_secs)?;
+    let state = AppState::new(cfg.clone(), analytics);
     state.load_persisted().await;
+
+    if state.analytics.enabled() && cfg.analytics.book_sample_secs > 0 {
+        tokio::spawn(book_sample_loop(state.clone()));
+    }
 
     if cfg.auto_discover {
         tracing::info!(
@@ -72,6 +80,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/category", post(add_category))
         .route("/category/:slug", delete(remove_category))
         .route("/search", get(search))
+        .route("/analytics/health", get(an_health))
+        .route("/analytics/summary", get(an_summary))
+        .route("/analytics/edge_histogram", get(an_edge_histogram))
+        .route("/analytics/decay", get(an_decay))
+        .route("/analytics/timeline", get(an_timeline))
+        .route("/analytics/markets", get(an_markets))
+        .route("/analytics/categories", get(an_categories))
+        .route("/analytics/heatmap", get(an_heatmap))
+        .route("/analytics/size_curve", get(an_size_curve))
+        .route("/analytics/liquidity", get(an_liquidity))
+        .route("/analytics/executions", get(an_executions))
+        .route("/analytics/export", get(an_export))
+        .route("/analytics/execution", post(an_log_execution))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
@@ -316,6 +337,7 @@ async fn health(State(app): State<App>) -> Json<serde_json::Value> {
         "split_opportunities": app.state.split_opps.read().await.len(),
         "last_update": last,
         "age_secs": age,
+        "analytics": app.state.analytics.stats(),
     }))
 }
 
@@ -358,9 +380,21 @@ async fn run_discovery_once(state: &AppState, gamma: &Gamma) {
         {
             Ok(markets) => {
                 for mut m in markets {
-                    // A market in several watched categories keeps the highest fee.
-                    let prev = desired.get(&m.condition_id).and_then(|e| e.fee_bps);
-                    m.fee_bps = Some(prev.map_or(fee, |p| p.max(fee)));
+                    // A market in several watched categories keeps the highest
+                    // fee, and is attributed to whichever of them charges it.
+                    let prev = desired
+                        .get(&m.condition_id)
+                        .and_then(|e| e.fee_bps.map(|f| (f, e.category.clone())));
+                    match prev {
+                        Some((prev_fee, prev_cat)) if prev_fee >= fee => {
+                            m.fee_bps = Some(prev_fee);
+                            m.category = prev_cat;
+                        }
+                        _ => {
+                            m.fee_bps = Some(fee);
+                            m.category = Some(c.slug.clone());
+                        }
+                    }
                     desired.insert(m.condition_id.clone(), m);
                 }
             }
@@ -380,6 +414,236 @@ async fn run_discovery_once(state: &AppState, gamma: &Gamma) {
             categories.len()
         );
     }
+}
+
+/// Probe every watched market on a timer, so the dataset has a baseline and not
+/// just the rare moments an arb existed.
+async fn book_sample_loop(state: AppState) {
+    let secs = state.cfg.analytics.book_sample_secs.max(10);
+    let mut prev_updates = HashMap::new();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tracing::info!(every_secs = secs, "book sampling enabled");
+    loop {
+        ticker.tick().await;
+        state.sample_books(&mut prev_updates).await;
+    }
+}
+
+// --- Analytics ------------------------------------------------------------
+//
+// Thin HTTP over `analytics::query`. The detector owns ClickHouse — the bot
+// never talks to it — so credentials stay in one process and the bot keeps
+// talking only to this API and to Telegram.
+
+#[derive(Debug, Default, Deserialize)]
+struct AnalyticsQuery {
+    /// `30m`, `24h`, `7d`, `90d`, or bare seconds. Defaults per endpoint.
+    window: Option<String>,
+    strategy: Option<String>,
+    bucket: Option<f64>,
+    bins: Option<u64>,
+    bucket_secs: Option<u64>,
+    limit: Option<u64>,
+    /// Minutes east of UTC, for the hour-of-day breakdown.
+    tz: Option<i64>,
+    table: Option<String>,
+}
+
+/// `45s` / `30m` / `24h` / `7d` / `2w`, or a plain number of seconds.
+fn parse_window(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (digits, mult) = match s.chars().last()? {
+        's' | 'S' => (&s[..s.len() - 1], 1),
+        'm' | 'M' => (&s[..s.len() - 1], 60),
+        'h' | 'H' => (&s[..s.len() - 1], 3_600),
+        'd' | 'D' => (&s[..s.len() - 1], 86_400),
+        'w' | 'W' => (&s[..s.len() - 1], 7 * 86_400),
+        _ => (s, 1),
+    };
+    digits.trim().parse::<u64>().ok()?.checked_mul(mult)
+}
+
+impl AnalyticsQuery {
+    fn secs(&self, default: u64) -> u64 {
+        self.window
+            .as_deref()
+            .and_then(parse_window)
+            .unwrap_or(default)
+    }
+}
+
+/// 503 while analytics is off or ClickHouse has not answered yet, 502 when a
+/// query itself fails — the bot renders either as a plain message.
+fn an_error(e: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::BAD_GATEWAY, e.to_string())
+}
+
+fn an_ready(app: &App) -> Result<(), (StatusCode, String)> {
+    if !app.state.analytics.enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "analytics is disabled — set clickhouse_url (DETECTOR_CLICKHOUSE_URL)".into(),
+        ));
+    }
+    if !app.state.analytics.ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "analytics is still connecting to ClickHouse".into(),
+        ));
+    }
+    Ok(())
+}
+
+type AnResult = Result<Json<serde_json::Value>, (StatusCode, String)>;
+
+async fn an_health(State(app): State<App>) -> Json<serde_json::Value> {
+    Json(app.state.analytics.stats())
+}
+
+async fn an_summary(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::summary(&app.state.analytics, q.secs(86_400), q.strategy.as_deref())
+        .await
+        .map(Json)
+        .map_err(an_error)
+}
+
+async fn an_edge_histogram(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::edge_histogram(
+        &app.state.analytics,
+        q.secs(7 * 86_400),
+        q.strategy.as_deref(),
+        q.bucket.unwrap_or(0.0025),
+        q.bins.unwrap_or(20),
+    )
+    .await
+    .map(Json)
+    .map_err(an_error)
+}
+
+async fn an_decay(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::decay(
+        &app.state.analytics,
+        q.secs(7 * 86_400),
+        q.strategy.as_deref(),
+    )
+    .await
+    .map(Json)
+    .map_err(an_error)
+}
+
+async fn an_timeline(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    let window = q.secs(24 * 3_600);
+    // ~48 points on the axis whatever the window, rounded to a whole minute.
+    let bucket = q.bucket_secs.unwrap_or_else(|| (window / 48).max(60));
+    aq::timeline(&app.state.analytics, window, bucket, q.strategy.as_deref())
+        .await
+        .map(Json)
+        .map_err(an_error)
+}
+
+async fn an_markets(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::markets(
+        &app.state.analytics,
+        q.secs(7 * 86_400),
+        q.limit.unwrap_or(15),
+    )
+    .await
+    .map(Json)
+    .map_err(an_error)
+}
+
+async fn an_categories(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::categories(&app.state.analytics, q.secs(7 * 86_400))
+        .await
+        .map(Json)
+        .map_err(an_error)
+}
+
+async fn an_heatmap(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::heatmap(&app.state.analytics, q.secs(30 * 86_400), q.tz.unwrap_or(0))
+        .await
+        .map(Json)
+        .map_err(an_error)
+}
+
+async fn an_size_curve(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::size_curve(
+        &app.state.analytics,
+        q.secs(30 * 86_400),
+        q.strategy.as_deref(),
+    )
+    .await
+    .map(Json)
+    .map_err(an_error)
+}
+
+async fn an_liquidity(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::liquidity(
+        &app.state.analytics,
+        q.secs(7 * 86_400),
+        q.limit.unwrap_or(15),
+    )
+    .await
+    .map(Json)
+    .map_err(an_error)
+}
+
+async fn an_executions(State(app): State<App>, Query(q): Query<AnalyticsQuery>) -> AnResult {
+    an_ready(&app)?;
+    aq::executions(&app.state.analytics, q.secs(7 * 86_400))
+        .await
+        .map(Json)
+        .map_err(an_error)
+}
+
+async fn an_export(
+    State(app): State<App>,
+    Query(q): Query<AnalyticsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    an_ready(&app)?;
+    let table = q.table.as_deref().unwrap_or("opportunities");
+    let csv = aq::export(
+        &app.state.analytics,
+        table,
+        q.secs(7 * 86_400),
+        q.limit.unwrap_or(50_000),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+        csv,
+    ))
+}
+
+/// Log a leg of a real trade. Nothing in this repo calls it — the project stops
+/// at detection — but an execution layer built on these alerts can POST here to
+/// put realised slippage, latency, gas and fills next to the signals that
+/// produced them, joined on `opportunity_id`.
+async fn an_log_execution(
+    State(app): State<App>,
+    Json(mut row): Json<ExecutionRow>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    an_ready(&app)?;
+    row.derive(now_ms());
+    app.state
+        .analytics
+        .record(Row::Execution(Box::new(row.clone())));
+    Ok(Json(serde_json::json!({
+        "logged": true,
+        "opportunity_id": row.opportunity_id,
+        "ts": row.ts,
+    })))
 }
 
 async fn get_config(State(app): State<App>) -> Json<serde_json::Value> {

@@ -49,3 +49,33 @@ gas_cost: 0.0       # fixed USDC gas for the CTF leg (merge for mint, split for 
 max_capital: 1000   # capital cap per trade, USDC
 min_profit: 0.0     # net USDC profit to flag as profitable
 min_edge: 0.0       # minimum gross edge to report (1-sum for mint, sum-1 for split)
+
+# --- Analytics (ClickHouse) -------------------------------------------------
+# History of every signal, so the bot can answer "why the drawdown" and "should
+# I raise my cut-off" later. Leave clickhouse_url empty to switch the whole
+# layer off: nothing is recorded, /analytics/* answers 503, and detection is
+# completely unaffected. Recording is fire-and-forget — a ClickHouse that is
+# down, slow or absent can never block or break the websocket loop.
+clickhouse_url: ""            # e.g. http://clickhouse:8123 (compose sets this)
+clickhouse_db: "arb"
+clickhouse_user: "default"
+clickhouse_password: ""
+
+# A standing arb is re-evaluated on every book delta. Only one row per this many
+# ms is kept while it stands, or a single busy market would be the whole dataset.
+# The open and close of every occurrence are always recorded.
+analytics_sample_ms: 500
+
+# Probe every watched market's book on this interval, arb or not. This is the
+# baseline the signals are read against — without it you only ever see the
+# moments something happened. 0 disables it. Note the volume: 2000 markets every
+# 5 min is ~576k rows/day, which ClickHouse handles easily but which is why the
+# liquidity charts read the hourly rollup instead of the raw table.
+analytics_book_sample_secs: 300
+
+analytics_trade_window_secs: 300  # rolling window behind traded_5m_usd
+analytics_depth_levels: 5         # order-book levels captured per side, per signal
+analytics_batch_rows: 500         # rows per insert
+analytics_flush_secs: 2           # ...or this often, whichever comes first
+analytics_queue_cap: 50000        # rows buffered before shedding (never blocks)
+analytics_ttl_days: 90            # ClickHouse drops partitions older than this

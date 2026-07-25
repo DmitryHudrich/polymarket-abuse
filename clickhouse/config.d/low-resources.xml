@@ -1,0 +1,58 @@
+<!--
+  ClickHouse tuned for a small VPS — the same box that runs the detector and the
+  bot. Stock ClickHouse assumes it owns the machine and will happily reserve
+  most of the RAM for caches; these overrides cap it to something a 2 GB box
+  survives. Raise them if you give analytics its own host.
+
+  Compose mounts this file individually rather than mounting the directory it
+  lives in: the official image ships its own docker_related_config.xml in
+  /etc/clickhouse-server/config.d, and that file is what makes the server listen
+  on anything but loopback. Shadowing the directory silently leaves ClickHouse
+  unreachable from the detector while still looking healthy from inside.
+-->
+<clickhouse>
+    <!-- Hard ceiling for the whole server, and per query. -->
+    <max_server_memory_usage>1073741824</max_server_memory_usage>       <!-- 1 GiB -->
+    <max_concurrent_queries>16</max_concurrent_queries>
+
+    <!-- Caches: stock defaults are 5 GiB mark + 8 GiB uncompressed. -->
+    <mark_cache_size>268435456</mark_cache_size>                        <!-- 256 MiB -->
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <index_mark_cache_size>67108864</index_mark_cache_size>             <!-- 64 MiB -->
+
+    <!-- The insert path is a few hundred rows every couple of seconds; a big
+         background pool is pure overhead here. The merge_tree thresholds below
+         MUST be lowered alongside it: they are stock-tuned for a stock-sized
+         pool, and ClickHouse refuses to start if a threshold exceeds
+         background_pool_size * background_merges_mutations_concurrency_ratio. -->
+    <background_pool_size>8</background_pool_size>
+    <background_schedule_pool_size>8</background_schedule_pool_size>
+    <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_execute_mutation>4</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>4</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>4</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+
+    <!-- System logs are themselves MergeTree tables and grow without bound on a
+         long-running box. Keep query_log (useful when a chart is slow), bound it,
+         and drop the ones nothing here reads. -->
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+        <flush_interval_milliseconds>10000</flush_interval_milliseconds>
+    </query_log>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <trace_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <part_log remove="1"/>
+    <text_log remove="1"/>
+    <session_log remove="1"/>
+
+    <logger>
+        <level>warning</level>
+        <console>1</console>
+    </logger>
+</clickhouse>

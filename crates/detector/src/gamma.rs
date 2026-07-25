@@ -292,6 +292,7 @@ impl GammaMarket {
             start_date: self.start_date,
             end_date: self.end_date,
             fee_bps: None,
+            category: None,
         })
     }
 }

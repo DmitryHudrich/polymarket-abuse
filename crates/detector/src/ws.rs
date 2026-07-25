@@ -3,7 +3,7 @@
 //! changes it reconnects with the new asset set.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -68,7 +68,9 @@ async fn stream(state: &AppState, tokens: Vec<String>) -> Result<()> {
             }
             msg = read.next() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => handle_text(state, &text).await,
+                    // The frame's arrival is time zero for the detection latency
+                    // recorded against every signal it produces.
+                    Some(Ok(Message::Text(text))) => handle_text(state, &text, Instant::now()).await,
                     Some(Ok(Message::Ping(p))) => write.send(Message::Pong(p)).await.context("pong failed")?,
                     Some(Ok(Message::Close(_))) | None => {
                         anyhow::bail!("connection closed by server");
@@ -81,29 +83,30 @@ async fn stream(state: &AppState, tokens: Vec<String>) -> Result<()> {
     }
 }
 
-async fn handle_text(state: &AppState, text: &str) {
+async fn handle_text(state: &AppState, text: &str, received: Instant) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
     match value {
         Value::Array(items) => {
             for item in items {
-                dispatch(state, item).await;
+                dispatch(state, item, received).await;
             }
         }
-        other => dispatch(state, other).await,
+        other => dispatch(state, other, received).await,
     }
 }
 
-async fn dispatch(state: &AppState, item: Value) {
+async fn dispatch(state: &AppState, item: Value, received: Instant) {
     match item.get("event_type").and_then(Value::as_str) {
-        Some("book") => apply_book(state, &item).await,
-        Some("price_change") => apply_price_change(state, &item).await,
+        Some("book") => apply_book(state, &item, received).await,
+        Some("price_change") => apply_price_change(state, &item, received).await,
+        Some("last_trade_price") => apply_trade(state, &item).await,
         _ => {}
     }
 }
 
-async fn apply_book(state: &AppState, item: &Value) {
+async fn apply_book(state: &AppState, item: &Value, received: Instant) {
     let Some(asset_id) = item.get("asset_id").and_then(Value::as_str) else {
         return;
     };
@@ -117,10 +120,30 @@ async fn apply_book(state: &AppState, item: &Value) {
             .or_default()
             .replace(bids, asks);
     }
-    recompute_token(state, asset_id).await;
+    recompute_token(state, asset_id, received).await;
 }
 
-async fn apply_price_change(state: &AppState, item: &Value) {
+/// A trade print, if the CLOB is emitting them on the market channel. Purely
+/// analytics — it never touches a book or an opportunity — so a feed that stops
+/// carrying `last_trade_price` just leaves the traded-volume columns at zero.
+async fn apply_trade(state: &AppState, item: &Value) {
+    let Some(asset_id) = item.get("asset_id").and_then(Value::as_str) else {
+        return;
+    };
+    let num = |k: &str| {
+        item.get(k).and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+    };
+    let (Some(price), Some(size)) = (num("price"), num("size")) else {
+        return;
+    };
+    let side = item.get("side").and_then(Value::as_str).unwrap_or("");
+    state.record_trade(asset_id, price, size, side).await;
+}
+
+async fn apply_price_change(state: &AppState, item: &Value, received: Instant) {
     let Some(changes) = item.get("price_changes").and_then(Value::as_array) else {
         return;
     };
@@ -147,14 +170,14 @@ async fn apply_price_change(state: &AppState, item: &Value) {
     }
 
     for cond in state.conditions_for_tokens(&touched).await {
-        state.recompute(&cond).await;
+        state.recompute(&cond, received).await;
     }
 }
 
-async fn recompute_token(state: &AppState, asset_id: &str) {
+async fn recompute_token(state: &AppState, asset_id: &str, received: Instant) {
     let cond = state.token_index.read().await.get(asset_id).cloned();
     if let Some(cond) = cond {
-        state.recompute(&cond).await;
+        state.recompute(&cond, received).await;
     }
 }
 

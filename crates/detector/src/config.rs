@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::analytics::AnalyticsConfig;
 use arb_core::ArbParams;
 
 fn env_str(key: &str) -> Option<String> {
@@ -53,6 +54,7 @@ pub struct Config {
     pub discover_max_markets: usize,
     pub category_fee_bps: HashMap<String, f64>,
     pub arb: ArbParams,
+    pub analytics: AnalyticsConfig,
 }
 
 impl Default for Config {
@@ -71,6 +73,7 @@ impl Default for Config {
             discover_max_markets: 100_000,
             category_fee_bps: default_category_fees(),
             arb: ArbParams::default(),
+            analytics: AnalyticsConfig::default(),
         }
     }
 }
@@ -99,6 +102,21 @@ pub struct PartialConfig {
     pub max_capital: Option<f64>,
     pub min_profit: Option<f64>,
     pub min_edge: Option<f64>,
+
+    /// Analytics. An empty `clickhouse_url` (the default) switches the whole
+    /// layer off: nothing is recorded and `/analytics/*` answers 503.
+    pub clickhouse_url: Option<String>,
+    pub clickhouse_db: Option<String>,
+    pub clickhouse_user: Option<String>,
+    pub clickhouse_password: Option<String>,
+    pub analytics_sample_ms: Option<u64>,
+    pub analytics_book_sample_secs: Option<u64>,
+    pub analytics_trade_window_secs: Option<u64>,
+    pub analytics_depth_levels: Option<usize>,
+    pub analytics_batch_rows: Option<usize>,
+    pub analytics_flush_secs: Option<u64>,
+    pub analytics_queue_cap: Option<usize>,
+    pub analytics_ttl_days: Option<u32>,
 }
 
 impl PartialConfig {
@@ -126,7 +144,19 @@ impl PartialConfig {
             gas_cost,
             max_capital,
             min_profit,
-            min_edge
+            min_edge,
+            clickhouse_url,
+            clickhouse_db,
+            clickhouse_user,
+            clickhouse_password,
+            analytics_sample_ms,
+            analytics_book_sample_secs,
+            analytics_trade_window_secs,
+            analytics_depth_levels,
+            analytics_batch_rows,
+            analytics_flush_secs,
+            analytics_queue_cap,
+            analytics_ttl_days
         );
         self
     }
@@ -151,6 +181,18 @@ impl PartialConfig {
             max_capital: env_parse("DETECTOR_MAX_CAPITAL"),
             min_profit: env_parse("DETECTOR_MIN_PROFIT"),
             min_edge: env_parse("DETECTOR_MIN_EDGE"),
+            clickhouse_url: env_str("DETECTOR_CLICKHOUSE_URL"),
+            clickhouse_db: env_str("DETECTOR_CLICKHOUSE_DB"),
+            clickhouse_user: env_str("DETECTOR_CLICKHOUSE_USER"),
+            clickhouse_password: env_str("DETECTOR_CLICKHOUSE_PASSWORD"),
+            analytics_sample_ms: env_parse("DETECTOR_ANALYTICS_SAMPLE_MS"),
+            analytics_book_sample_secs: env_parse("DETECTOR_ANALYTICS_BOOK_SAMPLE_SECS"),
+            analytics_trade_window_secs: env_parse("DETECTOR_ANALYTICS_TRADE_WINDOW_SECS"),
+            analytics_depth_levels: env_parse("DETECTOR_ANALYTICS_DEPTH_LEVELS"),
+            analytics_batch_rows: env_parse("DETECTOR_ANALYTICS_BATCH_ROWS"),
+            analytics_flush_secs: env_parse("DETECTOR_ANALYTICS_FLUSH_SECS"),
+            analytics_queue_cap: env_parse("DETECTOR_ANALYTICS_QUEUE_CAP"),
+            analytics_ttl_days: env_parse("DETECTOR_ANALYTICS_TTL_DAYS"),
         }
     }
 
@@ -178,6 +220,30 @@ impl PartialConfig {
                 max_capital: self.max_capital.unwrap_or(d.arb.max_capital),
                 min_profit: self.min_profit.unwrap_or(d.arb.min_profit),
                 min_edge: self.min_edge.unwrap_or(d.arb.min_edge),
+            },
+            analytics: AnalyticsConfig {
+                url: self.clickhouse_url.unwrap_or(d.analytics.url),
+                database: self.clickhouse_db.unwrap_or(d.analytics.database),
+                user: self.clickhouse_user.unwrap_or(d.analytics.user),
+                password: self.clickhouse_password.unwrap_or(d.analytics.password),
+                sample_ms: self.analytics_sample_ms.unwrap_or(d.analytics.sample_ms),
+                book_sample_secs: self
+                    .analytics_book_sample_secs
+                    .unwrap_or(d.analytics.book_sample_secs),
+                trade_window_secs: self
+                    .analytics_trade_window_secs
+                    .unwrap_or(d.analytics.trade_window_secs),
+                depth_levels: self
+                    .analytics_depth_levels
+                    .unwrap_or(d.analytics.depth_levels)
+                    .clamp(1, 20),
+                batch_rows: self.analytics_batch_rows.unwrap_or(d.analytics.batch_rows),
+                flush_secs: self.analytics_flush_secs.unwrap_or(d.analytics.flush_secs),
+                queue_cap: self.analytics_queue_cap.unwrap_or(d.analytics.queue_cap),
+                ttl_days: self
+                    .analytics_ttl_days
+                    .unwrap_or(d.analytics.ttl_days)
+                    .max(1),
             },
         }
     }
@@ -233,6 +299,32 @@ pub struct Cli {
     pub min_profit: Option<f64>,
     #[arg(long)]
     pub min_edge: Option<f64>,
+
+    /// ClickHouse HTTP endpoint, e.g. http://clickhouse:8123. Empty = analytics off.
+    #[arg(long)]
+    pub clickhouse_url: Option<String>,
+    #[arg(long)]
+    pub clickhouse_db: Option<String>,
+    #[arg(long)]
+    pub clickhouse_user: Option<String>,
+    #[arg(long)]
+    pub clickhouse_password: Option<String>,
+    #[arg(long)]
+    pub analytics_sample_ms: Option<u64>,
+    #[arg(long)]
+    pub analytics_book_sample_secs: Option<u64>,
+    #[arg(long)]
+    pub analytics_trade_window_secs: Option<u64>,
+    #[arg(long)]
+    pub analytics_depth_levels: Option<usize>,
+    #[arg(long)]
+    pub analytics_batch_rows: Option<usize>,
+    #[arg(long)]
+    pub analytics_flush_secs: Option<u64>,
+    #[arg(long)]
+    pub analytics_queue_cap: Option<usize>,
+    #[arg(long)]
+    pub analytics_ttl_days: Option<u32>,
 }
 
 impl Cli {
@@ -256,6 +348,18 @@ impl Cli {
             max_capital: self.max_capital,
             min_profit: self.min_profit,
             min_edge: self.min_edge,
+            clickhouse_url: self.clickhouse_url,
+            clickhouse_db: self.clickhouse_db,
+            clickhouse_user: self.clickhouse_user,
+            clickhouse_password: self.clickhouse_password,
+            analytics_sample_ms: self.analytics_sample_ms,
+            analytics_book_sample_secs: self.analytics_book_sample_secs,
+            analytics_trade_window_secs: self.analytics_trade_window_secs,
+            analytics_depth_levels: self.analytics_depth_levels,
+            analytics_batch_rows: self.analytics_batch_rows,
+            analytics_flush_secs: self.analytics_flush_secs,
+            analytics_queue_cap: self.analytics_queue_cap,
+            analytics_ttl_days: self.analytics_ttl_days,
         };
         (self.config, p)
     }

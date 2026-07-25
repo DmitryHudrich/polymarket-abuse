@@ -9,8 +9,19 @@ name = "telegram-bot"
 path = "src/main.rs"
 
 [dependencies]
+arb-core = { workspace = true }
+# Charts are rendered in-process to PNG. `ab_glyph` is the pure-Rust text path:
+# it takes the font faces vendored in `assets/`, so the runtime image needs no
+# fonts, no fontconfig and no freetype.
+plotters = { version = "0.3.7", default-features = false, features = [
+    "bitmap_backend",
+    "ab_glyph",
+    "all_series",
+    "all_elements",
+] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
