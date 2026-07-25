@@ -250,6 +250,8 @@ struct GammaMarket {
     #[serde(rename = "acceptingOrders")]
     accepting_orders: Option<bool>,
     closed: Option<bool>,
+    #[serde(rename = "startDate")]
+    start_date: Option<String>,
     #[serde(rename = "endDate")]
     end_date: Option<String>,
     #[serde(rename = "volumeNum")]
@@ -287,6 +289,7 @@ impl GammaMarket {
             yes_token: ids[yes_idx].clone(),
             no_token: ids[no_idx].clone(),
             volume: self.volume_num.unwrap_or(0.0),
+            start_date: self.start_date,
             end_date: self.end_date,
             fee_bps: None,
         })

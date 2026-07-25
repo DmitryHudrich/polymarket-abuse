@@ -262,6 +262,8 @@ async fn list_watch(State(app): State<App>) -> Json<serde_json::Value> {
                 "condition_id": m.condition_id,
                 "volume": m.volume,
                 "market_url": m.market_url(),
+                "start_date": m.start_date,
+                "end_date": m.end_date,
             })
         })
         .collect();
@@ -293,6 +295,8 @@ async fn search(
                 "condition_id": m.condition_id,
                 "volume": m.volume,
                 "market_url": m.market_url(),
+                "start_date": m.start_date,
+                "end_date": m.end_date,
             })
         })
         .collect();

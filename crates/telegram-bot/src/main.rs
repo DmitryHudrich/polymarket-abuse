@@ -158,6 +158,9 @@ struct Opportunity {
     condition_id: String,
     volume: f64,
     market_url: String,
+    /// Trading window from Gamma, ISO 8601 (absent on an older backend).
+    #[serde(default)]
+    start_date: Option<String>,
     #[serde(default)]
     end_date: Option<String>,
     arb: Arb,
@@ -908,12 +911,14 @@ impl Bot {
                 if markets.is_empty() {
                     return "Watchlist is empty. Add one with /add or /search.".into();
                 }
+                let tz = self.cfg.tz_offset_minutes;
                 let mut s = format!("<b>Watching {} market(s)</b>\n", markets.len());
                 for m in &markets {
                     s.push_str(&format!(
-                        "• {}\n  <code>{}</code>\n",
+                        "• {}\n  <code>{}</code>{}\n",
                         esc(m["question"].as_str().unwrap_or("")),
                         esc(m["slug"].as_str().unwrap_or("")),
+                        fmt_window_short(m, tz),
                     ));
                 }
                 s
@@ -934,12 +939,14 @@ impl Bot {
                 if results.is_empty() {
                     return "Nothing found.".into();
                 }
+                let tz = self.cfg.tz_offset_minutes;
                 let mut s = String::from("<b>Results</b> (tap a slug, then /add it)\n\n");
                 for m in &results {
                     s.push_str(&format!(
-                        "• {}\n  <code>{}</code>\n",
+                        "• {}\n  <code>{}</code>{}\n",
                         esc(m["question"].as_str().unwrap_or("")),
                         esc(m["slug"].as_str().unwrap_or("")),
+                        fmt_window_short(m, tz),
                     ));
                 }
                 s
@@ -1065,19 +1072,7 @@ fn format_alert(o: &Opportunity, tz: i64) -> String {
             "best asks",
         )
     };
-    // The split leg closes the same instant it opens, so there is nothing to sit
-    // on until resolution — the note only applies to the buy-and-merge side.
-    let resolves = o
-        .end_date
-        .as_deref()
-        .filter(|_| !split)
-        .map(|d| {
-            format!(
-                "\nresolves: <code>{}</code> (locked until then unless you merge)",
-                esc(d)
-            )
-        })
-        .unwrap_or_default();
+    let window = fmt_window(o.start_date.as_deref(), o.end_date.as_deref(), tz, !split);
     format!(
         "{header}\n<b>{q}</b>\n\n\
          effective edge: <b>{avg:.3}</b> per set on <b>{size:.0}</b> sets\n\
@@ -1085,7 +1080,7 @@ fn format_alert(o: &Opportunity, tz: i64) -> String {
          {plan}\n\
          fees: <code>${fees:.2}</code> (2 taker legs)  gas: <code>${gas:.2}</code>\n\
          {book_label}: YES <code>{yes:.4}</code> + NO <code>{no:.4}</code> = <code>{sum:.4}</code> (edge {edge:.4})\n\
-         volume: <code>${vol:.0}</code>{spotted}{resolves}\n\
+         volume: <code>${vol:.0}</code>{spotted}{window}\n\
          <a href=\"{url}\">open market</a>",
         header = header,
         q = esc(&o.question),
@@ -1103,7 +1098,7 @@ fn format_alert(o: &Opportunity, tz: i64) -> String {
         edge = a.gross_edge,
         vol = o.volume,
         spotted = fmt_spotted(o.first_seen, tz),
-        resolves = resolves,
+        window = window,
         url = esc(&o.market_url),
     )
 }
@@ -1174,6 +1169,53 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// Days since the epoch for a civil date — Hinnant's `days_from_civil`, the
+/// inverse of [`civil_from_days`], used to turn Gamma's ISO dates into unix time.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Unix seconds from an ISO 8601 timestamp as Gamma sends it
+/// (`2026-11-03T12:00:00Z`, sometimes date-only or with a `±HH:MM` zone).
+/// Fractional seconds are ignored; anything unparseable yields `None`.
+fn parse_iso8601(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() < 10 {
+        return None;
+    }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let m: u32 = s.get(5..7)?.parse().ok()?;
+    let d: u32 = s.get(8..10)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+
+    let mut secs = days_from_civil(y, m, d) * 86_400;
+    if b.len() >= 16 && (b[10] == b'T' || b[10] == b' ') {
+        secs += s.get(11..13)?.parse::<i64>().ok()? * 3_600;
+        secs += s.get(14..16)?.parse::<i64>().ok()? * 60;
+        if b.len() >= 19 && b[16] == b':' {
+            secs += s.get(17..19)?.parse::<i64>().unwrap_or(0);
+        }
+        // A trailing zone offset, if any, is what the wall clock was shifted by.
+        if let Some(i) = s.rfind(['+', '-']).filter(|i| *i >= 11) {
+            let z = &s[i + 1..];
+            let zh: i64 = z.get(0..2).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let zm: i64 = z.get(3..5).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let sign = if b[i] == b'-' { 1 } else { -1 };
+            secs += sign * (zh * 3_600 + zm * 60);
+        }
+    }
+    u64::try_from(secs).ok()
+}
+
 /// Wall-clock `(year, month, day, hour, minute, second)` at the configured UTC offset.
 fn wall_clock(ts: u64, offset_minutes: i64) -> (i64, u32, u32, u32, u32, u32) {
     let local = ts as i64 + offset_minutes * 60;
@@ -1227,6 +1269,75 @@ fn fmt_age(secs: u64) -> String {
         s if s < 3_600 => format!("{}m {:02}s", s / 60, s % 60),
         s if s < 86_400 => format!("{}h {:02}m", s / 3_600, s % 3_600 / 60),
         s => format!("{}d {}h", s / 86_400, s % 86_400 / 3_600),
+    }
+}
+
+/// A market date for chat: `3 Nov 2026 12:00 UTC+3`, or `3 Nov 2026` when
+/// `with_clock` is false. Unparseable input is passed through as-is.
+fn fmt_market_date(iso: &str, tz: i64, with_clock: bool) -> String {
+    let Some(ts) = parse_iso8601(iso) else {
+        return esc(iso);
+    };
+    let (y, m, d, hh, mm, _) = wall_clock(ts, tz);
+    let month = MONTHS[(m as usize - 1).min(11)];
+    if with_clock {
+        format!("{d} {month} {y} {hh:02}:{mm:02} {}", tz_label(tz))
+    } else {
+        format!("{d} {month} {y}")
+    }
+}
+
+/// How far a market date is from now: `in 3d 4h`, or `2h 10m ago` once passed.
+fn fmt_relative(iso: &str) -> String {
+    let Some(ts) = parse_iso8601(iso) else {
+        return String::new();
+    };
+    let now = now();
+    if ts >= now {
+        format!(" (in {})", fmt_age(ts - now))
+    } else {
+        format!(" ({} ago)", fmt_age(now - ts))
+    }
+}
+
+/// The market's trading window. `merge_note` adds the buy-and-hold caveat, which
+/// only applies to the mint direction — a split closes the same instant it opens.
+fn fmt_window(start: Option<&str>, end: Option<&str>, tz: i64, merge_note: bool) -> String {
+    let mut s = String::new();
+    if let Some(start) = start.filter(|d| !d.is_empty()) {
+        s.push_str(&format!(
+            "\nmarket opened: <b>{}</b>",
+            fmt_market_date(start, tz, true)
+        ));
+    }
+    if let Some(end) = end.filter(|d| !d.is_empty()) {
+        s.push_str(&format!(
+            "\nmarket closes: <b>{}</b>{}{}",
+            fmt_market_date(end, tz, true),
+            fmt_relative(end),
+            if merge_note {
+                " — held until then unless you merge"
+            } else {
+                ""
+            },
+        ));
+    }
+    s
+}
+
+/// One-line trading window for market listings: ` · 12 Jan 2026 → 3 Nov 2026`.
+/// Empty when the backend reports neither date.
+fn fmt_window_short(m: &serde_json::Value, tz: i64) -> String {
+    let day = |k: &str| {
+        m[k].as_str()
+            .filter(|d| !d.is_empty())
+            .map(|d| fmt_market_date(d, tz, false))
+    };
+    match (day("start_date"), day("end_date")) {
+        (Some(a), Some(b)) => format!(" · {a} → {b}"),
+        (Some(a), None) => format!(" · opened {a}"),
+        (None, Some(b)) => format!(" · closes {b}"),
+        (None, None) => String::new(),
     }
 }
 
@@ -1364,6 +1475,70 @@ mod tests {
         assert_eq!(fmt_age(200), "3m 20s");
         assert_eq!(fmt_age(7_500), "2h 05m");
         assert_eq!(fmt_age(97_200), "1d 3h");
+    }
+
+    #[test]
+    fn iso_timestamps_round_trip_through_civil_days() {
+        assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso8601("2026-07-25T16:23:41Z"), Some(1_784_996_621));
+        // Date-only, fractional seconds, and a non-UTC zone that shifts the instant.
+        assert_eq!(parse_iso8601("2024-02-29"), Some(1_709_164_800));
+        assert_eq!(
+            parse_iso8601("2026-07-25T16:23:41.123456Z"),
+            Some(1_784_996_621)
+        );
+        assert_eq!(
+            parse_iso8601("2026-07-25T19:23:41+03:00"),
+            Some(1_784_996_621)
+        );
+        assert_eq!(
+            parse_iso8601("2026-07-25T13:23:41-03:00"),
+            Some(1_784_996_621)
+        );
+        // Every day of a leap year survives the round trip.
+        for day in 0..366 {
+            let ts = 1_704_067_200 + day * 86_400; // from 2024-01-01
+            let (y, m, d, ..) = wall_clock(ts, 0);
+            assert_eq!(days_from_civil(y, m, d) * 86_400, ts as i64);
+        }
+    }
+
+    #[test]
+    fn market_dates_render_in_the_configured_zone() {
+        assert_eq!(
+            fmt_market_date("2026-07-25T16:23:41Z", 180, true),
+            "25 Jul 2026 19:23 UTC+3"
+        );
+        assert_eq!(
+            fmt_market_date("2026-07-25T16:23:41Z", 0, false),
+            "25 Jul 2026"
+        );
+        // An offset can roll the date over, and garbage is passed through escaped.
+        assert_eq!(
+            fmt_market_date("2026-07-25T23:30:00Z", 60, false),
+            "26 Jul 2026"
+        );
+        assert_eq!(fmt_market_date("not a date", 0, true), "not a date");
+        assert_eq!(fmt_market_date("<b>x</b>", 0, true), "&lt;b&gt;x&lt;/b&gt;");
+    }
+
+    #[test]
+    fn window_lines_adapt_to_missing_dates() {
+        let full = fmt_window(
+            Some("2026-01-12T09:00:00Z"),
+            Some("2026-11-03T12:00:00Z"),
+            0,
+            true,
+        );
+        assert!(full.contains("market opened: <b>12 Jan 2026 09:00 UTC</b>"));
+        assert!(full.contains("market closes: <b>3 Nov 2026 12:00 UTC</b>"));
+        assert!(full.contains("held until then unless you merge"));
+
+        // The split direction gets no merge caveat, and empty strings are skipped.
+        let split = fmt_window(Some(""), Some("2026-11-03T12:00:00Z"), 0, false);
+        assert!(!split.contains("market opened"));
+        assert!(!split.contains("unless you merge"));
+        assert!(fmt_window(None, None, 0, true).is_empty());
     }
 
     #[test]

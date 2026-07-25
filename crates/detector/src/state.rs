@@ -54,6 +54,10 @@ pub struct Market {
     pub yes_token: String,
     pub no_token: String,
     pub volume: f64,
+    /// Trading window as reported by Gamma, ISO 8601. `start_date` is when the
+    /// market opened, `end_date` when it closes/resolves.
+    #[serde(default)]
+    pub start_date: Option<String>,
     #[serde(default)]
     pub end_date: Option<String>,
     /// Taker fee (bps per side) for this market's category, assigned at discovery.
@@ -185,6 +189,7 @@ pub struct Opportunity {
     pub no_token: String,
     pub volume: f64,
     pub market_url: String,
+    pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub arb: ArbResult,
     /// When this occurrence of the opportunity first appeared. Preserved across
@@ -250,11 +255,20 @@ impl AppState {
         out
     }
 
-    /// Add a market and its token routing, seeding empty books. Returns false
-    /// if it was already watched.
+    /// Add a market and its token routing, seeding empty books. Returns false if
+    /// it was already watched, in which case its mutable metadata (volume, dates,
+    /// question, fee) is refreshed from `m` — token ids and books are immutable
+    /// for a condition and are left untouched, so a discovery pass keeps the
+    /// watchlist current without disturbing the live stream.
     pub async fn add_market(&self, m: Market) -> bool {
         let mut watch = self.watch.write().await;
-        if watch.contains_key(&m.condition_id) {
+        if let Some(existing) = watch.get_mut(&m.condition_id) {
+            existing.question = m.question;
+            existing.slug = m.slug;
+            existing.volume = m.volume;
+            existing.start_date = m.start_date;
+            existing.end_date = m.end_date;
+            existing.fee_bps = m.fee_bps;
             return false;
         }
         let mut idx = self.token_index.write().await;
@@ -444,6 +458,7 @@ impl AppState {
                     no_token: market.no_token.clone(),
                     volume: market.volume,
                     market_url: market.market_url(),
+                    start_date: market.start_date.clone(),
                     end_date: market.end_date.clone(),
                     arb: arb.clone(),
                     first_seen,

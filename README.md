@@ -244,7 +244,10 @@ by at least `realert_improvement`.
 
 **Timestamps.** Every alert carries `spotted: <time> (<age> ago)` — when the backend *first*
 saw this occurrence of the opportunity, not when the message was sent, so a re-alert still
-shows how long the edge has been standing. An opportunity that disappears and comes back
+shows how long the edge has been standing. Alerts also show the market's **trading window**
+(`market opened:` / `market closes:` with time-to-close), and `/list` / `/search` append a
+compact `12 Jan 2026 → 3 Nov 2026` to each market. Both dates come from Gamma and are
+refreshed on every discovery pass. An opportunity that disappears and comes back
 counts as a new occurrence. Micro-crossings show the moment they opened alongside how long
 they lived. Times are rendered at `tz_offset_hours` and always carry their zone
 (`16:23:41 UTC+3`), with the date added once an item is no longer from today.
@@ -273,8 +276,9 @@ digest too long for one Telegram message is split, with the button on the last p
 `GET /opportunities` filters: `profitable=true|false`, `min_edge=<f>`, `min_profit=<f>`,
 `strategy=mint|split`, `limit=<n>`. Each opportunity carries market metadata plus an `arb`
 object (`strategy`, `best_yes`, `best_no`, `sum`, `gross_edge`, `size`, `cost`, `payout`,
-`fees`, `gas`, `net_profit`, `roi`, `avg_edge`, `profitable`), plus `first_seen` (unix
-seconds, when this occurrence appeared) and `updated_at` (last recompute).
+`fees`, `gas`, `net_profit`, `roi`, `avg_edge`, `profitable`), plus `start_date`/`end_date`
+(ISO 8601 trading window), `first_seen` (unix seconds, when this occurrence appeared) and
+`updated_at` (last recompute). `GET /watch` and `GET /search` carry the same two dates.
 
 `strategy` is `mint` (best_yes/best_no are **asks**, `cost` is the ladder spend, `payout`
 is `size`) or `split` (best_yes/best_no are **bids**, `cost` is `size` — $1 per minted set
