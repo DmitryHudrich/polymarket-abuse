@@ -331,6 +331,19 @@ struct TradePrint {
     notional: f64,
 }
 
+/// **Lock order: `watch` → `token_index` → `books` → `opps` / `split_opps`.**
+///
+/// A task that needs two of these at once takes them in that order. A task that
+/// needs them the other way round releases the first guard before taking the
+/// second — see `record_trade`. This is not a stylistic rule: `record_trade`
+/// once held `token_index` while reaching for `watch` at the same time as
+/// `add_market` held `watch` while reaching for `token_index`, and one
+/// discovery pass racing one trade print was enough to wedge every task in the
+/// process, `/health` included.
+///
+/// The remaining locks (`categories`, `manual`, `crossings_*`, `trades`) are
+/// leaves: nothing is held across their acquisition, so they stay out of the
+/// order.
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
@@ -624,18 +637,24 @@ impl AppState {
         if !self.analytics.enabled() {
             return;
         }
-        let (condition_id, outcome) = {
+        // Two lookups, two separate guards, `watch` last: `add_market` and
+        // `remove_market` hold `watch` while they reach for `token_index`, so
+        // holding `token_index` across the `watch` acquisition here would close
+        // a deadlock cycle. See the lock order on `AppState`.
+        let condition_id = {
             let idx = self.token_index.read().await;
-            let Some(cond) = idx.get(token_id).cloned() else {
-                return;
-            };
+            match idx.get(token_id) {
+                Some(cond) => cond.clone(),
+                None => return,
+            }
+        };
+        let outcome = {
             let watch = self.watch.read().await;
-            let outcome = match watch.get(&cond) {
+            match watch.get(&condition_id) {
                 Some(m) if m.yes_token == token_id => "yes",
                 Some(_) => "no",
                 None => return,
-            };
-            (cond, outcome)
+            }
         };
         self.analytics.record(Row::Trade(Box::new(TradeRow {
             ts: arb_core::time::clickhouse_datetime(now_ms()),
@@ -1214,4 +1233,77 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analytics::AnalyticsConfig;
+
+    fn market(i: usize) -> Market {
+        Market {
+            question: format!("question {i}"),
+            slug: format!("slug-{i}"),
+            condition_id: format!("cond-{i}"),
+            yes_token: format!("yes-{i}"),
+            no_token: format!("no-{i}"),
+            volume: 0.0,
+            start_date: None,
+            end_date: None,
+            fee_bps: None,
+            category: None,
+        }
+    }
+
+    /// A sink pointed at a port nothing listens on: `enabled()` is true, so the
+    /// trade path runs past its early return, and every flush fails harmlessly.
+    fn state() -> AppState {
+        let analytics = Analytics::start(
+            AnalyticsConfig {
+                url: "http://127.0.0.1:1/".into(),
+                ..Default::default()
+            },
+            1,
+        )
+        .expect("analytics sink");
+        AppState::new(Arc::new(Config::default()), analytics)
+    }
+
+    /// A discovery pass and a trade print must not be able to wedge each other.
+    /// These two paths touch `watch` and `token_index` from opposite ends, and
+    /// when they took them in opposite orders a single interleaving deadlocked
+    /// every task in the process. A deadlock cannot be asserted on directly, so
+    /// this test can only fail by hanging — which is why it carries its own
+    /// timeout rather than waiting for the harness to give up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discovery_pass_and_a_trade_print_do_not_deadlock() {
+        let state = state();
+        // Seed the token the trade prints reference, so they reach the `watch`
+        // lookup instead of returning early on an unknown token.
+        state.add_market(market(0)).await;
+
+        let writer = tokio::spawn({
+            let state = state.clone();
+            async move {
+                for i in 0..5_000 {
+                    state.add_market(market(i)).await;
+                }
+            }
+        });
+        let trades = tokio::spawn({
+            let state = state.clone();
+            async move {
+                for _ in 0..5_000 {
+                    state.record_trade("yes-0", 0.5, 10.0, "BUY").await;
+                }
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            writer.await.unwrap();
+            trades.await.unwrap();
+        })
+        .await
+        .expect("deadlock: watch and token_index acquired in conflicting orders");
+    }
 }
