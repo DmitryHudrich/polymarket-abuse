@@ -2,3 +2,8 @@
 .env
 *.log
 /.claude
+
+# runtime state written by the binaries
+watchlist.json
+bot-settings.json
+bot-archive.json

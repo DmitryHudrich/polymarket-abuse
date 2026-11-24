@@ -1,5 +1,8 @@
 # Polymarket YES/NO arbitrage alerter
 
+[![CI](https://github.com/DmitryHudrich/polymarket-abuse/actions/workflows/ci.yml/badge.svg)](https://github.com/DmitryHudrich/polymarket-abuse/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Alerts-only tooling for the Polymarket YES/NO set arbitrage, in both directions — buy a
 set below $1 and merge it, or split $1 into a set and sell it above $1. It **detects**
 opportunities and **notifies** you; it never signs, funds, or places an order. Two
@@ -553,3 +556,7 @@ capital are *modelled* from the configured parameters, not realised. Slippage, g
 confirmation latency and toxic fills belong to execution; the `executions` table is
 specified and reachable over `POST /analytics/execution` so an external executor can fill
 it in, and it stays empty until one does.
+
+## License
+
+[MIT](LICENSE). The bundled Noto Sans fonts keep their own OFL license (`crates/telegram-bot/assets/NotoSans-LICENSE.txt`).
