@@ -5,3 +5,5 @@ target
 .env
 watchlist.json
 *.md
+bot-settings.json
+bot-archive.json
